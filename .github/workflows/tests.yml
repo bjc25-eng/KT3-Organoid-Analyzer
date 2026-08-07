@@ -29,7 +29,10 @@ jobs:
           pip install pytest
 
       - name: Compile application
-        run: python -m py_compile app.py
+        run: |
+          python -m py_compile app.py
+          python -m py_compile advanced_analysis.py
+          python -m py_compile pages/2_Advanced_Response_Analysis.py
 
       - name: Run automated test suite
-        run: pytest -q tests/test_app.py
+        run: pytest -q tests
