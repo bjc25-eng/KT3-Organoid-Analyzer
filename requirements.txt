@@ -6,3 +6,6 @@ matplotlib>=3.8
 scipy>=1.11
 scikit-image>=0.22
 opencv-python-headless>=4.9
+tifffile>=2024.8
+zarr>=2.18,<4
+fsspec>=2024.6
