@@ -9,6 +9,7 @@ import pytest
 from PIL import Image
 
 import app
+import analysis_core as core
 
 
 class FakeUpload:
@@ -215,7 +216,7 @@ def synthetic_pipeline_image(with_pdo=True, with_psc=True):
 
 
 def test_process_end_to_end_with_pdo_and_psc(monkeypatch):
-    monkeypatch.setattr(app, "detect_wells", lambda rgb, s: fixed_wells())
+    monkeypatch.setattr(core, "detect_wells", lambda rgb, s: fixed_wells())
     upload = FakeUpload("KT3 test (series 01).png", synthetic_pipeline_image(True, True))
     root, out, summary, image_summary = app.process([upload], app.Settings(), 4)
 
@@ -245,7 +246,7 @@ def test_process_end_to_end_with_pdo_and_psc(monkeypatch):
 
 
 def test_process_handles_zero_pdo_image(monkeypatch):
-    monkeypatch.setattr(app, "detect_wells", lambda rgb, s: fixed_wells())
+    monkeypatch.setattr(core, "detect_wells", lambda rgb, s: fixed_wells())
     upload = FakeUpload("blank (series 02).png", synthetic_pipeline_image(False, False))
     root, out, summary, image_summary = app.process([upload], app.Settings(), 4)
     assert int(summary.iloc[0]["PDO_count"]) == 0
@@ -255,7 +256,7 @@ def test_process_handles_zero_pdo_image(monkeypatch):
 
 
 def test_process_raises_helpful_error_if_no_wells(monkeypatch):
-    monkeypatch.setattr(app, "detect_wells", lambda rgb, s: np.empty((0, 3), dtype=int))
+    monkeypatch.setattr(core, "detect_wells", lambda rgb, s: np.empty((0, 3), dtype=int))
     upload = FakeUpload("bad.png", synthetic_rgb(120))
     with pytest.raises(RuntimeError, match="No fully visible wells detected"):
         app.process([upload], app.Settings(), 4)
