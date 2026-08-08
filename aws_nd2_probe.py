@@ -99,6 +99,12 @@ def _download_http(url: str, destination: Path) -> None:
     with requests.get(url, stream=True, timeout=(30, 300)) as response:
         response.raise_for_status()
         total = int(response.headers.get('content-length') or 0)
+        free = shutil.disk_usage(destination.parent).free
+        if total and free < total + (512 * 1024 * 1024):
+            raise OSError(
+                f'Not enough free scratch space: need about {(total + 512 * 1024 * 1024) / 1e9:.2f} GB, '
+                f'have {free / 1e9:.2f} GB in {destination.parent}'
+            )
         done = 0
         with destination.open('wb') as fh:
             for chunk in response.iter_content(chunk_size=16 * 1024 * 1024):
@@ -126,6 +132,12 @@ def _download_s3(uri: str, destination: Path) -> None:
     s3 = boto3.client('s3')
     head = s3.head_object(Bucket=bucket, Key=key)
     total = int(head.get('ContentLength') or 0)
+    free = shutil.disk_usage(destination.parent).free
+    if total and free < total + (512 * 1024 * 1024):
+        raise OSError(
+            f'Not enough free scratch space: need about {(total + 512 * 1024 * 1024) / 1e9:.2f} GB, '
+            f'have {free / 1e9:.2f} GB in {destination.parent}'
+        )
     done = 0
 
     def progress(n):
@@ -207,7 +219,14 @@ def main() -> int:
     args = parser.parse_args()
 
     scratch_owner = args.scratch_dir is None
-    scratch = Path(tempfile.mkdtemp(prefix='nd2_probe_')) if scratch_owner else args.scratch_dir.expanduser().resolve()
+    # Avoid /tmp: small cloud instances can mount it as a limited tmpfs even
+    # when the main EBS volume has ample free space.  Use a unique directory
+    # on the user's home filesystem by default.
+    scratch = (
+        Path(tempfile.mkdtemp(prefix='nd2_probe_', dir=str(Path.home())))
+        if scratch_owner
+        else args.scratch_dir.expanduser().resolve()
+    )
     scratch.mkdir(parents=True, exist_ok=True)
     local_path = None
     downloaded = False
