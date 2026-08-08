@@ -34,9 +34,11 @@ jobs:
           python -m py_compile analysis_core.py
           python -m py_compile advanced_analysis.py
           python -m py_compile large_data_core.py
+          python -m py_compile nd2_large_source.py
           python -m py_compile main_ui.py
           python -m py_compile pages/2_Advanced_Response_Analysis.py
           python -m py_compile pages/3_Large_Dataset_Whole_Array.py
+          python -m py_compile pages/4_Nikon_ND2_Whole_Array.py
 
       - name: Run automated test suite
         run: pytest -q tests
