@@ -13,3 +13,4 @@ requests>=2.31
 aiohttp>=3.9
 nd2>=0.10
 dask[array]>=2024.6
+boto3>=1.34
