@@ -1,20 +1,23 @@
 from __future__ import annotations
 
-"""S3-aware façade around the validated KT3 analysis core.
+"""S3-aware facade around the validated KT3 analysis core.
 
 The scientific segmentation and measurement logic remains in ``analysis_core.py``.
-This module adds AWS S3 I/O without duplicating or changing that logic.
+This module adds AWS S3 I/O plus one-PDO-per-crop exports without changing the
+validated segmentation thresholds or object measurements.
 """
 
-import io
+import math
 import os
 import re
-import zipfile
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
 import boto3
+import pandas as pd
+from PIL import Image, ImageDraw, ImageFont
 
 from analysis_core import (
     APP_TITLE,
@@ -24,7 +27,7 @@ from analysis_core import (
     PSC_PRESENT,
     Settings,
     build_settings_from_widgets,
-    process,
+    process as core_process,
     process_experiment,
     zip_bytes,
 )
@@ -33,7 +36,7 @@ SUPPORTED_IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
 
 
 class LocalUpload:
-    """Small adapter that makes a local/S3-downloaded file look like Streamlit UploadedFile."""
+    """Make a local/S3-downloaded file look like Streamlit UploadedFile."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -41,6 +44,140 @@ class LocalUpload:
 
     def getbuffer(self):
         return memoryview(self.path.read_bytes())
+
+
+def _font(size: int = 18, bold: bool = False):
+    try:
+        return ImageFont.truetype('DejaVuSans-Bold.ttf' if bold else 'DejaVuSans.ttf', size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _fixed_crop(image: Image.Image, cx: float, cy: float, size: int = 256) -> Image.Image:
+    half = size // 2
+    left = int(round(cx)) - half
+    top = int(round(cy)) - half
+    right, bottom = left + size, top + size
+    canvas = Image.new('RGB', (size, size), 'black')
+    sl, st = max(0, left), max(0, top)
+    sr, sb = min(image.width, right), min(image.height, bottom)
+    if sr > sl and sb > st:
+        patch = image.crop((sl, st, sr, sb))
+        canvas.paste(patch, (sl - left, st - top))
+    return canvas
+
+
+def _label_pdo_crop(crop: Image.Image, row: pd.Series) -> Image.Image:
+    title = _font(18, True)
+    body = _font(15, False)
+    psc = row.get('PSC_like_focus_count_in_well', None)
+    psc_text = 'not analysed' if pd.isna(psc) else str(int(psc))
+    well = str(row['well_index'])
+    n = int(row['PDO_number_in_well'])
+    total = int(row['PDO_count_in_well'])
+    ecd = float(row['equivalent_circular_diameter_um'])
+    lines = [
+        f"Image {int(row['image_series']):02d} | Well {well} | PDO {n}/{total}",
+        f"Equivalent circular diameter: {ecd:.1f} µm",
+        f"PSC-like foci in well: {psc_text}",
+    ]
+    header = 92
+    out = Image.new('RGB', (crop.width, crop.height + header), 'white')
+    out.paste(crop, (0, header))
+    d = ImageDraw.Draw(out)
+    d.rectangle((0, 0, out.width, header), fill='black')
+    y = 7
+    for i, text in enumerate(lines):
+        f = title if i == 0 else body
+        d.text((10, y), text, font=f, fill='white')
+        y += 30 if i == 0 else 25
+    return out
+
+
+def _contact_sheet(paths: list[Path], out_path: Path, columns: int = 5, tile_width: int = 260, gap: int = 6):
+    if not paths:
+        return
+    images = []
+    for path in paths:
+        im = Image.open(path).convert('RGB')
+        scale = tile_width / im.width
+        images.append(im.resize((tile_width, int(round(im.height * scale))), Image.Resampling.LANCZOS))
+    cell_h = max(im.height for im in images)
+    rows = math.ceil(len(images) / columns)
+    sheet = Image.new('RGB', (columns * tile_width + (columns + 1) * gap,
+                              rows * cell_h + (rows + 1) * gap), 'white')
+    for i, im in enumerate(images):
+        row, col = divmod(i, columns)
+        sheet.paste(im, (gap + col * (tile_width + gap), gap + row * (cell_h + gap)))
+    sheet.save(out_path, dpi=(300, 300))
+
+
+def add_pdo_centred_exports(out_dir: str | Path, crop_size_px: int = 256, contact_columns: int = 5) -> pd.DataFrame:
+    """Create exactly one raw/labelled crop per automatically detected PDO."""
+    out_dir = Path(out_dir)
+    pdo_csv = out_dir / 'csv' / 'PDO_raw_data.csv'
+    well_csv = out_dir / 'csv' / 'well_raw_data.csv'
+    if not pdo_csv.exists() or not well_csv.exists():
+        return pd.DataFrame()
+
+    pdo = pd.read_csv(pdo_csv)
+    wells = pd.read_csv(well_csv)
+    if pdo.empty:
+        empty = out_dir / 'csv' / 'PDO_centred_raw_data.csv'
+        pdo.to_csv(empty, index=False)
+        return pdo
+
+    lookup = wells[[
+        'image_series', 'source_image', 'well_index', 'well_col_index', 'well_row_index',
+        'well_centre_x_px', 'well_centre_y_px', 'well_radius_px', 'um_per_pixel'
+    ]].drop_duplicates(['image_series', 'well_index'])
+    pdo = pdo.merge(lookup, on=['image_series', 'well_index'], how='left')
+
+    raw_dir = out_dir / 'pdo_centred_raw_crops'
+    labelled_dir = out_dir / 'pdo_centred_labelled_crops'
+    raw_dir.mkdir(exist_ok=True)
+    labelled_dir.mkdir(exist_ok=True)
+    labelled_paths: list[Path] = []
+    raw_names, labelled_names = [], []
+
+    image_cache: dict[tuple[int, str], Image.Image] = {}
+    for idx, row in pdo.iterrows():
+        series = int(row['image_series'])
+        source = str(row['source_image'])
+        key = (series, source)
+        if key not in image_cache:
+            raw_path = out_dir / 'raw_images' / f'series_{series:02d}__{source}'
+            image_cache[key] = Image.open(raw_path).convert('RGB')
+        image = image_cache[key]
+        crop = _fixed_crop(image, float(row['centroid_x_px']), float(row['centroid_y_px']), int(crop_size_px))
+        well_slug = str(row['well_index']).replace(',', '_')
+        pno = int(row['PDO_number_in_well'])
+        stem = f'series_{series:02d}_well_{well_slug}_PDO_{pno:02d}'
+        rp = raw_dir / f'{stem}.png'
+        lp = labelled_dir / f'{stem}_labelled.png'
+        crop.save(rp, dpi=(300, 300))
+        _label_pdo_crop(crop, row).save(lp, dpi=(300, 300))
+        raw_names.append(rp.name)
+        labelled_names.append(lp.name)
+        labelled_paths.append(lp)
+
+    pdo['pdo_centred_raw_crop'] = raw_names
+    pdo['pdo_centred_labelled_crop'] = labelled_names
+    pdo['projected_area_um2'] = pdo['projected_area_px2'].astype(float) * (pdo['um_per_pixel'].astype(float) ** 2)
+    pdo['distance_to_well_centre_px'] = ((pdo['centroid_x_px'] - pdo['well_centre_x_px']) ** 2 +
+                                         (pdo['centroid_y_px'] - pdo['well_centre_y_px']) ** 2) ** 0.5
+    pdo.to_csv(out_dir / 'csv' / 'PDO_centred_raw_data.csv', index=False)
+    _contact_sheet(labelled_paths, out_dir / 'figures' / 'PDO_centred_contact_sheet_compact.png',
+                   columns=int(contact_columns))
+    return pdo
+
+
+def process(files, settings: Settings, cols: int = 5, create_pdo_centred: bool = True, crop_size_px: int = 256):
+    """Run the validated core, then optionally add one-PDO-per-crop exports."""
+    root, out, summary, image_summary = core_process(files, settings, int(cols))
+    if create_pdo_centred:
+        add_pdo_centred_exports(out, crop_size_px=int(crop_size_px), contact_columns=int(cols))
+    return root, out, summary, image_summary
 
 
 def get_s3_client(
@@ -60,7 +197,6 @@ def get_s3_client(
 
 
 def list_s3_images(client, bucket: str, prefix: str = '') -> list[str]:
-    """List supported microscopy image keys below an S3 prefix."""
     keys: list[str] = []
     paginator = client.get_paginator('list_objects_v2')
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
@@ -72,7 +208,6 @@ def list_s3_images(client, bucket: str, prefix: str = '') -> list[str]:
 
 
 def download_s3_images(client, bucket: str, keys: Iterable[str], destination: str | Path) -> list[Path]:
-    """Download selected S3 microscopy images and return local file paths."""
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
@@ -88,18 +223,23 @@ def download_s3_images(client, bucket: str, keys: Iterable[str], destination: st
     return paths
 
 
-def process_s3_batch(client, bucket: str, keys: list[str], settings: Settings, cols: int = 5):
-    """Download an S3 batch and run the unchanged validated analysis core."""
-    import tempfile
-
+def process_s3_batch(
+    client,
+    bucket: str,
+    keys: list[str],
+    settings: Settings,
+    cols: int = 5,
+    create_pdo_centred: bool = True,
+    crop_size_px: int = 256,
+):
     root = Path(tempfile.mkdtemp(prefix='kt3_s3_input_'))
     paths = download_s3_images(client, bucket, keys, root)
     uploads = [LocalUpload(p) for p in paths]
-    return process(uploads, settings, int(cols))
+    return process(uploads, settings, int(cols), create_pdo_centred=create_pdo_centred,
+                   crop_size_px=int(crop_size_px))
 
 
 def upload_directory_to_s3(client, local_dir: str | Path, bucket: str, prefix: str) -> int:
-    """Upload every file in an analysis result directory to S3."""
     local_dir = Path(local_dir)
     prefix = prefix.strip('/')
     count = 0
@@ -143,7 +283,6 @@ def archive_results_to_s3(
     run_label: str = '',
     zip_name: str = 'KT3_PDO_PSC_analysis_results.zip',
 ) -> dict:
-    """Persist the full result tree plus one ZIP in S3 and return their locations."""
     out_dir = Path(out_dir)
     prefix = result_prefix(base_prefix, run_label)
     file_count = upload_directory_to_s3(client, out_dir, bucket, prefix)
