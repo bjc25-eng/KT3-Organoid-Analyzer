@@ -90,6 +90,7 @@ def main() -> int:
     ap.add_argument('--green-low', type=float, default=30.0)
     ap.add_argument('--green-high', type=float, default=45.0)
     ap.add_argument('--pdo-min-area', type=int, default=20)
+    ap.add_argument('--no-split-pdos', action='store_true', help='Conservative QC: treat each contiguous GFP-positive component as one PDO and disable watershed splitting.')
     args = ap.parse_args()
 
     src = args.source.expanduser().resolve()
@@ -116,6 +117,7 @@ def main() -> int:
         well_diameter_um=float(args.well_diameter_um),
         green_low=float(args.green_low), green_high=float(args.green_high),
         pdo_min_area=int(args.pdo_min_area), rfp_psc_present=False,
+        split_pdos=not bool(args.no_split_pdos),
     )
 
     rows=[]
@@ -126,7 +128,6 @@ def main() -> int:
     pen=ImageDraw.Draw(marked)
 
     for wi,(wx,wy,wr) in enumerate(wells,1):
-        # High-contrast QC well outline: magenta, not used in scientific outputs.
         pen.ellipse((wx-wr,wy-wr,wx+wr,wy+wr), outline=(255,0,255), width=3)
         cr=int(math.ceil(wr*0.95))
         xa=max(0,wx-cr); xb=min(tile,wx+cr+1)
@@ -137,7 +138,6 @@ def main() -> int:
         mask=(xx-cx)**2+(yy-cy)**2 <= (0.86*wr)**2
         green=gaussian_filter(np.where(mask,sub,0.0),0.8)
         objects=segment_pdos(green,settings)
-        # Retain only candidate centroids in the interior mask.
         kept=[]
         for obj in objects:
             ox=float(obj['x']); oy=float(obj['y'])
@@ -170,6 +170,8 @@ def main() -> int:
         'pixel_size_um':{'x':px_x,'y':px_y},'expected_well_radius_px':expected_radius,
         'detected_wells':int(len(wells)),'detected_pdos':int(total_pdos),
         'pdo_positive_wells':int(len({r['well_number'] for r in rows})),
+        'split_pdos':bool(settings.split_pdos),
+        'segmentation_mode':'conservative_contiguous_components' if args.no_split_pdos else 'watershed_split_enabled',
         'green_low_uint8':float(args.green_low),'green_high_uint8':float(args.green_high),
         'gfp_raw_min':int(graw.min()),'gfp_raw_max':int(graw.max()),
         'qc_overlay_legend':'magenta = detected microwell; cyan = automated PDO equivalent-area circle',
