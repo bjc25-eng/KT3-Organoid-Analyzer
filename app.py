@@ -21,6 +21,7 @@ from processor import (
     process_s3_batch,
     zip_bytes,
 )
+from s3_omezarr import list_s3_omezarr_datasets, process_s3_omezarr
 
 
 def secret(name: str, default: str = '') -> str:
@@ -76,16 +77,14 @@ def show_results(out: Path, summary: pd.DataFrame, image_summary: pd.DataFrame, 
     if len(summary):
         row = summary.iloc[0]
         a, b, c, d, e = st.columns(5)
-        a.metric('Images', int(row.get('images_processed', 0)))
+        a.metric('Images / datasets', int(row.get('images_processed', 0)))
         b.metric('Visible wells', int(row.get('fully_visible_wells', 0)))
         c.metric('PDO wells', int(row.get('PDO_containing_wells', 0)))
         d.metric('PDOs', int(row.get('PDO_count', 0)))
         m = row.get('mean_PDO_diameter_um', None)
         e.metric('Mean PDO diameter', f'{float(m):.1f} µm' if m is not None and pd.notna(m) else '—')
 
-    st.warning(
-        'Automated outputs require visual QC. Keep the manually QC\'d thesis dataset separate from a fresh automated rerun if their PDO counts differ.'
-    )
+    st.warning('Automated outputs require visual QC before thesis/publication use.')
 
     payload = zip_bytes(out)
     st.download_button(
@@ -103,6 +102,7 @@ def show_results(out: Path, summary: pd.DataFrame, image_summary: pd.DataFrame, 
     figs = [
         ('PDO size distribution', out/'figures'/'PDO_size_distribution.png'),
         ('PSC frequency across PDOs', out/'figures'/'PSC_count_frequency_across_PDOs.png'),
+        ('PDO count per well', out/'figures'/'PDO_count_per_well_distribution.png'),
         ('PDO-centred contact sheet', out/'figures'/'PDO_centred_contact_sheet_compact.png'),
         ('PDO-well contact sheet', out/'figures'/'PDO_well_contact_sheet_compact.png'),
     ]
@@ -112,7 +112,7 @@ def show_results(out: Path, summary: pd.DataFrame, image_summary: pd.DataFrame, 
         for col, (label, p) in zip(cc, figs[start:start+2]):
             col.image(str(p), caption=label, use_container_width=True)
 
-    with st.expander('Image-by-image summary'):
+    with st.expander('Image / dataset summary'):
         st.dataframe(image_summary, use_container_width=True, hide_index=True)
 
     pdo_csv = out/'csv'/'PDO_centred_raw_data.csv'
@@ -133,14 +133,14 @@ def show_results(out: Path, summary: pd.DataFrame, image_summary: pd.DataFrame, 
 
 st.set_page_config(page_title=APP_TITLE, page_icon='🔬', layout='wide')
 st.title(APP_TITLE)
-st.caption('S3-backed single/batch PDO + PSC analysis. The longitudinal multi-condition workflow remains available from the Streamlit page menu.')
+st.caption('S3-backed PDO analysis with direct whole-array OME-Zarr support.')
 
 with st.expander('Measurement notes'):
     st.markdown('''
 - PDO size is a **2D equivalent circular diameter** from segmented projected area, not a true 3D organoid diameter.
-- PSC counts are **PSC-like red fluorescent foci**, not definitive individual-cell counts.
-- The new PDO-centred export generates **one crop per automatically detected PDO**, so multiple PDOs in one well produce multiple crops.
-- Indexed overlays and labelled crops should be visually reviewed before thesis/publication use.
+- The OME-Zarr route streams the whole array directly from S3 instead of treating generated PNG crops as independent inputs.
+- The OME-Zarr whole-array route currently measures GFP PDOs and **does not count PSC/RFP foci** unless a dedicated red-channel workflow is added.
+- Automated outputs should be visually reviewed before thesis/publication use.
 ''')
 
 base_settings, cols, create_pdo_centred, crop_size = settings_sidebar()
@@ -158,16 +158,18 @@ source = st.radio('Choose input source', ['AWS S3', 'Browser upload'], horizonta
 
 bucket_default = secret('S3_BUCKET')
 region_default = secret('AWS_DEFAULT_REGION', 'eu-west-2')
-input_prefix_default = secret('S3_INPUT_PREFIX', 'uploads/')
+input_prefix_default = secret('S3_INPUT_PREFIX', 'converted/')
 output_prefix_default = secret('S3_OUTPUT_PREFIX', 'results/')
 
 selected_keys = []
+selected_dataset = ''
 uploaded = []
 bucket = bucket_default
 region = region_default
 output_prefix = output_prefix_default
 save_to_s3 = False
 run_label = ''
+s3_mode = 'OME-Zarr dataset'
 
 if source == 'AWS S3':
     c1, c2 = st.columns([2, 1])
@@ -175,19 +177,38 @@ if source == 'AWS S3':
     region = c2.text_input('AWS region', region_default)
     input_prefix = st.text_input('Input prefix', input_prefix_default)
 
-    if st.button('List S3 images', disabled=not bool(bucket)):
-        try:
-            client = s3_client(region)
-            st.session_state['s3_keys'] = list_s3_images(client, bucket, input_prefix)
-        except (NoCredentialsError, ClientError, BotoCoreError) as exc:
-            st.error(f'Could not read S3: {exc}')
+    s3_mode = st.radio('S3 input type', ['OME-Zarr dataset', 'Individual image files'], horizontal=True)
 
-    keys = st.session_state.get('s3_keys', [])
-    if keys:
-        st.caption(f'Found {len(keys)} supported image(s).')
-        selected_keys = st.multiselect('Images to analyse', keys, default=keys)
+    if s3_mode == 'OME-Zarr dataset':
+        if st.button('List S3 datasets', disabled=not bool(bucket)):
+            try:
+                client = s3_client(region)
+                st.session_state['s3_datasets'] = list_s3_omezarr_datasets(client, bucket, input_prefix)
+            except (NoCredentialsError, ClientError, BotoCoreError) as exc:
+                st.error(f'Could not read S3: {exc}')
+        datasets = st.session_state.get('s3_datasets', [])
+        if datasets:
+            st.caption(f'Found {len(datasets)} OME-Zarr dataset(s).')
+            selected_dataset = st.selectbox('Dataset to analyse', datasets)
+            with st.expander('OME-Zarr processing options'):
+                gfp_channel = st.number_input('GFP channel index', min_value=0, value=0, step=1)
+                dic_channel = st.number_input('DIC / brightfield channel index', min_value=0, value=1, step=1)
+                tile_size = st.selectbox('Tile size (px)', [2048, 3072, 4096], index=2)
+        else:
+            st.info('Click “List S3 datasets”. The app will treat each *.ome.zarr/ folder as one dataset.')
     else:
-        st.info('Enter the bucket/prefix and click “List S3 images”.')
+        if st.button('List S3 images', disabled=not bool(bucket)):
+            try:
+                client = s3_client(region)
+                st.session_state['s3_keys'] = list_s3_images(client, bucket, input_prefix)
+            except (NoCredentialsError, ClientError, BotoCoreError) as exc:
+                st.error(f'Could not read S3: {exc}')
+        keys = st.session_state.get('s3_keys', [])
+        if keys:
+            st.caption(f'Found {len(keys)} supported image(s).')
+            selected_keys = st.multiselect('Images to analyse', keys, default=[])
+        else:
+            st.info('Click “List S3 images”. Images are no longer auto-selected.')
 
     st.markdown('#### Result storage')
     output_prefix = st.text_input('Output prefix', output_prefix_default)
@@ -206,14 +227,30 @@ else:
             output_prefix = st.text_input('Result prefix', output_prefix_default)
             run_label = st.text_input('Optional run label', '')
 
-has_input = bool(selected_keys) if source == 'AWS S3' else bool(uploaded)
+if source == 'AWS S3' and s3_mode == 'OME-Zarr dataset':
+    has_input = bool(selected_dataset)
+elif source == 'AWS S3':
+    has_input = bool(selected_keys)
+else:
+    has_input = bool(uploaded)
+
 run = st.button('Run analysis', type='primary', use_container_width=True, disabled=not has_input)
 
 if run:
     bar = st.progress(5, text='Preparing analysis…')
     try:
         client = None
-        if source == 'AWS S3':
+        if source == 'AWS S3' and s3_mode == 'OME-Zarr dataset':
+            if organoid_mode != GFP_MODE:
+                raise RuntimeError('The whole-array OME-Zarr route currently supports GFP-labelled PDO detection.')
+            bar.progress(12, text='Streaming OME-Zarr dataset from S3…')
+            client = s3_client(region)
+            _, out, summary, image_summary = process_s3_omezarr(
+                client, bucket, selected_dataset, settings, region=region, cols=cols,
+                tile_size=int(tile_size), gfp_channel=int(gfp_channel), dic_channel=int(dic_channel),
+                crop_size_px=crop_size, create_pdo_centred=create_pdo_centred
+            )
+        elif source == 'AWS S3':
             bar.progress(12, text='Downloading selected microscopy images from S3…')
             client = s3_client(region)
             _, out, summary, image_summary = process_s3_batch(
@@ -248,7 +285,7 @@ if run:
     except Exception as exc:
         bar.empty()
         st.error(f'Analysis stopped: {exc}')
-        st.info('For S3 errors, check Streamlit Secrets and IAM access. For image-analysis errors, review the well radius and detection thresholds.')
+        st.info('For S3 errors, check Streamlit Secrets/IAM access. For analysis errors, review the channel indices and detection thresholds.')
 
 if 'out' in st.session_state:
     out = Path(st.session_state['out'])
