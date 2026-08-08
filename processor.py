@@ -3,13 +3,15 @@ from __future__ import annotations
 """S3-aware facade around the validated KT3 analysis core.
 
 The scientific segmentation and measurement logic remains in ``analysis_core.py``.
-This module adds AWS S3 I/O plus one-PDO-per-crop exports without changing the
-validated segmentation thresholds or object measurements.
+This module adds AWS S3 I/O plus one-PDO-per-crop exports. For GFP datasets it
+also applies the conservative PDO duplicate/outside-well QC implemented in
+``pdo_qc.py`` before final exports are generated.
 """
 
 import math
 import os
 import re
+import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +33,7 @@ from analysis_core import (
     process_experiment,
     zip_bytes,
 )
+from pdo_qc import rebuild_quantitative_outputs
 
 SUPPORTED_IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
 
@@ -76,10 +79,11 @@ def _label_pdo_crop(crop: Image.Image, row: pd.Series) -> Image.Image:
     n = int(row['PDO_number_in_well'])
     total = int(row['PDO_count_in_well'])
     ecd = float(row['equivalent_circular_diameter_um'])
+    qc = str(row.get('membership_status', 'accepted'))
     lines = [
         f"Image {int(row['image_series']):02d} | Well {well} | PDO {n}/{total}",
         f"Equivalent circular diameter: {ecd:.1f} µm",
-        f"PSC-like foci in well: {psc_text}",
+        f"PSC-like foci in well: {psc_text} | QC: {qc}",
     ]
     header = 92
     out = Image.new('RGB', (crop.width, crop.height + header), 'white')
@@ -113,7 +117,7 @@ def _contact_sheet(paths: list[Path], out_path: Path, columns: int = 5, tile_wid
 
 
 def add_pdo_centred_exports(out_dir: str | Path, crop_size_px: int = 256, contact_columns: int = 5) -> pd.DataFrame:
-    """Create exactly one raw/labelled crop per automatically detected PDO."""
+    """Create exactly one raw/labelled crop per final accepted/retained PDO."""
     out_dir = Path(out_dir)
     pdo_csv = out_dir / 'csv' / 'PDO_raw_data.csv'
     well_csv = out_dir / 'csv' / 'well_raw_data.csv'
@@ -122,9 +126,19 @@ def add_pdo_centred_exports(out_dir: str | Path, crop_size_px: int = 256, contac
 
     pdo = pd.read_csv(pdo_csv)
     wells = pd.read_csv(well_csv)
+
+    raw_dir = out_dir / 'pdo_centred_raw_crops'
+    labelled_dir = out_dir / 'pdo_centred_labelled_crops'
+    for d in [raw_dir, labelled_dir]:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(exist_ok=True)
+
     if pdo.empty:
-        empty = out_dir / 'csv' / 'PDO_centred_raw_data.csv'
-        pdo.to_csv(empty, index=False)
+        pdo.to_csv(out_dir / 'csv' / 'PDO_centred_raw_data.csv', index=False)
+        contact = out_dir / 'figures' / 'PDO_centred_contact_sheet_compact.png'
+        if contact.exists():
+            contact.unlink()
         return pdo
 
     lookup = wells[[
@@ -133,15 +147,11 @@ def add_pdo_centred_exports(out_dir: str | Path, crop_size_px: int = 256, contac
     ]].drop_duplicates(['image_series', 'well_index'])
     pdo = pdo.merge(lookup, on=['image_series', 'well_index'], how='left')
 
-    raw_dir = out_dir / 'pdo_centred_raw_crops'
-    labelled_dir = out_dir / 'pdo_centred_labelled_crops'
-    raw_dir.mkdir(exist_ok=True)
-    labelled_dir.mkdir(exist_ok=True)
     labelled_paths: list[Path] = []
     raw_names, labelled_names = [], []
-
     image_cache: dict[tuple[int, str], Image.Image] = {}
-    for idx, row in pdo.iterrows():
+
+    for _, row in pdo.iterrows():
         series = int(row['image_series'])
         source = str(row['source_image'])
         key = (series, source)
@@ -167,14 +177,28 @@ def add_pdo_centred_exports(out_dir: str | Path, crop_size_px: int = 256, contac
     pdo['distance_to_well_centre_px'] = ((pdo['centroid_x_px'] - pdo['well_centre_x_px']) ** 2 +
                                          (pdo['centroid_y_px'] - pdo['well_centre_y_px']) ** 2) ** 0.5
     pdo.to_csv(out_dir / 'csv' / 'PDO_centred_raw_data.csv', index=False)
-    _contact_sheet(labelled_paths, out_dir / 'figures' / 'PDO_centred_contact_sheet_compact.png',
-                   columns=int(contact_columns))
+
+    contact = out_dir / 'figures' / 'PDO_centred_contact_sheet_compact.png'
+    if contact.exists():
+        contact.unlink()
+    _contact_sheet(labelled_paths, contact, columns=int(contact_columns))
     return pdo
 
 
 def process(files, settings: Settings, cols: int = 5, create_pdo_centred: bool = True, crop_size_px: int = 256):
-    """Run the validated core, then optionally add one-PDO-per-crop exports."""
+    """Run core analysis, then apply conservative GFP QC before final exports.
+
+    Fixes applied for GFP data:
+    - prevents intensity-only over-segmentation/duplicate PDOs;
+    - rejects clear outside-microwell objects and flags ambiguous edge objects;
+    - regenerates corrected well/PDO tables, figures and crops;
+    - creates one PDO-centred crop only from the corrected PDO table.
+    """
     root, out, summary, image_summary = core_process(files, settings, int(cols))
+
+    if settings.organoid_mode == GFP_MODE:
+        summary, image_summary = rebuild_quantitative_outputs(out, settings, cols=int(cols))
+
     if create_pdo_centred:
         add_pdo_centred_exports(out, crop_size_px=int(crop_size_px), contact_columns=int(cols))
     return root, out, summary, image_summary
