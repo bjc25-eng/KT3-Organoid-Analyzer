@@ -41,9 +41,33 @@ def _intensity_max(root, channel: int, dtype) -> float:
     return float(np.iinfo(dtype).max) if np.issubdtype(dtype, np.integer) else 1.0
 
 
-def _u8(arr: np.ndarray, maximum: float) -> np.ndarray:
+def _u8_absolute(arr: np.ndarray, maximum: float) -> np.ndarray:
+    """Absolute fluorescence scaling using the acquisition bit-depth/window."""
     a = np.asarray(arr, dtype=np.float32)
     return np.clip(a * (255.0 / max(float(maximum), 1.0)), 0, 255).astype(np.uint8)
+
+
+def _u8_local_contrast(arr: np.ndarray, low_pct: float = 0.5, high_pct: float = 99.5) -> tuple[np.ndarray, float, float]:
+    """Percentile-normalise a structural/DIC tile for geometry detection.
+
+    DIC is used here only to reveal microwell edges.  Its absolute grey level is
+    not a biological measurement, so stretching each tile independently is
+    appropriate and avoids collapsing a narrow raw range into only a few uint8
+    levels.
+    """
+    a = np.asarray(arr, dtype=np.float32)
+    finite = a[np.isfinite(a)]
+    if finite.size == 0:
+        return np.zeros(a.shape, dtype=np.uint8), 0.0, 0.0
+    lo = float(np.percentile(finite, low_pct))
+    hi = float(np.percentile(finite, high_pct))
+    if hi <= lo:
+        lo = float(np.min(finite))
+        hi = float(np.max(finite))
+    if hi <= lo:
+        return np.zeros(a.shape, dtype=np.uint8), lo, hi
+    out = np.clip((a - lo) * (255.0 / (hi - lo)), 0, 255).astype(np.uint8)
+    return out, lo, hi
 
 
 def main() -> int:
@@ -83,8 +107,12 @@ def main() -> int:
 
     gfp_raw = np.asarray(arr[int(args.gfp_channel), y0:y1, x0:x1])
     dic_raw = np.asarray(arr[int(args.dic_channel), y0:y1, x0:x1])
-    gfp = _u8(gfp_raw, _intensity_max(root, int(args.gfp_channel), arr.dtype))
-    dic = _u8(dic_raw, _intensity_max(root, int(args.dic_channel), arr.dtype))
+
+    # Preserve absolute fluorescence scaling for GFP so thresholds remain tied
+    # to the acquisition intensity range.  DIC is structural only, so use a
+    # local percentile stretch to expose microwell edges robustly.
+    gfp = _u8_absolute(gfp_raw, _intensity_max(root, int(args.gfp_channel), arr.dtype))
+    dic, dic_p_low, dic_p_high = _u8_local_contrast(dic_raw)
 
     blur = cv2.GaussianBlur(dic, (7, 7), 1.5)
     circles = cv2.HoughCircles(
@@ -94,8 +122,6 @@ def main() -> int:
     wells = [] if circles is None else np.round(circles[0]).astype(int).tolist()
 
     dic_rgb = np.stack([dic, dic, dic], axis=-1)
-    # Green overlay is intentionally simple for QC: DIC remains visible in all
-    # channels while GFP raises only the green display channel.
     overlay = dic_rgb.copy()
     overlay[..., 1] = np.maximum(overlay[..., 1], gfp)
     Image.fromarray(overlay).save(out/'central_DIC_GFP_overlay.png')
@@ -127,6 +153,10 @@ def main() -> int:
         'gfp_raw_max': int(np.max(gfp_raw)),
         'dic_raw_min': int(np.min(dic_raw)),
         'dic_raw_max': int(np.max(dic_raw)),
+        'dic_local_contrast_low_raw': dic_p_low,
+        'dic_local_contrast_high_raw': dic_p_high,
+        'dic_uint8_min': int(dic.min()),
+        'dic_uint8_max': int(dic.max()),
     }
     (out/'preview_summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
     print(json.dumps(summary, indent=2))
