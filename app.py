@@ -21,7 +21,7 @@ from processor import (
     process_s3_batch,
     zip_bytes,
 )
-from s3_omezarr import list_s3_omezarr_datasets, process_s3_omezarr
+from s3_omezarr_qc import list_s3_omezarr_datasets, process_s3_omezarr
 
 
 def secret(name: str, default: str = '') -> str:
@@ -46,6 +46,14 @@ def settings_sidebar():
     st.sidebar.header('Analysis settings')
     well = st.sidebar.number_input('Microwell diameter (µm)', 1.0, 1000.0, 100.0, 1.0)
     split = st.sidebar.checkbox('Split touching PDOs', True)
+    exclude_ambiguous = st.sidebar.checkbox(
+        'Exclude ambiguous wall-touching PDO candidates',
+        False,
+        help=(
+            'Clear outside-well candidates are always rejected. Leave this off to retain '
+            'borderline wall-touching PDOs but flag them for visual QC.'
+        ),
+    )
     bins = st.sidebar.slider('Histogram bins', 5, 30, 12)
     cols = st.sidebar.slider('Contact-sheet columns', 3, 10, 5)
     create_pdo_centred = st.sidebar.checkbox('Create one crop per PDO', True)
@@ -68,6 +76,9 @@ def settings_sidebar():
         well, rmin, rmax, spacing, hp2, gl, gh, amin, split, pdist,
         pt, prm, ppd, bins, bf_contrast, bf_min_area
     )
+    # The QC module reads this optional setting without changing the validated
+    # Settings dataclass/schema used elsewhere in the project.
+    settings.exclude_ambiguous_edge_candidates = bool(exclude_ambiguous)
     return settings, int(cols), bool(create_pdo_centred), int(crop_size)
 
 
@@ -84,7 +95,18 @@ def show_results(out: Path, summary: pd.DataFrame, image_summary: pd.DataFrame, 
         m = row.get('mean_PDO_diameter_um', None)
         e.metric('Mean PDO diameter', f'{float(m):.1f} µm' if m is not None and pd.notna(m) else '—')
 
-    st.warning('Automated outputs require visual QC before thesis/publication use.')
+        rejected = row.get('qc_rejected_outside_well_candidates', None)
+        ambiguous = row.get('qc_ambiguous_PDO_candidates', None)
+        if rejected is not None or ambiguous is not None:
+            q1, q2 = st.columns(2)
+            q1.metric('Outside-well candidates rejected', int(rejected or 0))
+            q2.metric('Ambiguous wall-touching candidates', int(ambiguous or 0))
+
+    st.warning(
+        'Automated outputs require visual QC before thesis/publication use. Clear outside-well GFP '
+        'objects are rejected. Borderline wall-touching candidates are retained and flagged by default '
+        'unless you select “Exclude ambiguous wall-touching PDO candidates”.'
+    )
 
     payload = zip_bytes(out)
     st.download_button(
@@ -103,6 +125,7 @@ def show_results(out: Path, summary: pd.DataFrame, image_summary: pd.DataFrame, 
         ('PDO size distribution', out/'figures'/'PDO_size_distribution.png'),
         ('PSC frequency across PDOs', out/'figures'/'PSC_count_frequency_across_PDOs.png'),
         ('PDO count per well', out/'figures'/'PDO_count_per_well_distribution.png'),
+        ('PDO candidate QC', out/'figures'/'PDO_candidate_QC_contact_sheet.png'),
         ('PDO-centred contact sheet', out/'figures'/'PDO_centred_contact_sheet_compact.png'),
         ('PDO-well contact sheet', out/'figures'/'PDO_well_contact_sheet_compact.png'),
     ]
@@ -115,12 +138,24 @@ def show_results(out: Path, summary: pd.DataFrame, image_summary: pd.DataFrame, 
     with st.expander('Image / dataset summary'):
         st.dataframe(image_summary, use_container_width=True, hide_index=True)
 
+    qc_csv = out/'csv'/'PDO_candidate_QC.csv'
+    if qc_csv.exists():
+        qc_df = pd.read_csv(qc_csv)
+        with st.expander('PDO candidate QC — accepted, ambiguous and rejected'):
+            st.dataframe(qc_df, use_container_width=True, hide_index=True)
+            if len(qc_df):
+                counts = qc_df['membership_status'].value_counts().to_dict()
+                st.caption(
+                    'Candidate-level audit trail: '
+                    + ', '.join(f'{k}: {v}' for k, v in counts.items())
+                )
+
     pdo_csv = out/'csv'/'PDO_centred_raw_data.csv'
     if pdo_csv.exists():
         pdo_df = pd.read_csv(pdo_csv)
         with st.expander('PDO-level table'):
             st.dataframe(pdo_df, use_container_width=True, hide_index=True)
-            st.caption(f'One row per automatically detected PDO: {len(pdo_df)} rows.')
+            st.caption(f'One row per final automatically retained PDO: {len(pdo_df)} rows.')
 
     overlays = sorted((out/'indexed_large_images').glob('*.png'))
     if overlays:
@@ -138,7 +173,9 @@ st.caption('S3-backed PDO analysis with direct whole-array OME-Zarr support.')
 with st.expander('Measurement notes'):
     st.markdown('''
 - PDO size is a **2D equivalent circular diameter** from segmented projected area, not a true 3D organoid diameter.
-- The OME-Zarr route streams the whole array directly from S3 instead of treating generated PNG crops as independent inputs.
+- Touching PDOs are split only when the **shape** of the connected GFP object supports multiple lobes; multiple fluorescence-intensity peaks alone no longer create duplicate PDOs.
+- For individual-image analysis, clear GFP objects outside the detected microwell interior are rejected using centroid, segmented-shape and microwell-wall evidence. Ambiguous wall-touching objects are flagged for visual QC.
+- The OME-Zarr route streams the whole array directly from S3 and restricts GFP segmentation to the inner microwell region before applying the same conservative touching-PDO split logic.
 - The OME-Zarr whole-array route currently measures GFP PDOs and **does not count PSC/RFP foci** unless a dedicated red-channel workflow is added.
 - Automated outputs should be visually reviewed before thesis/publication use.
 ''')
@@ -152,6 +189,10 @@ with a:
 with b:
     psc_mode = st.selectbox('Are RFP-labelled PSC/stromal cells present?', [PSC_PRESENT, PSC_ABSENT])
 settings = replace(base_settings, organoid_mode=organoid_mode, rfp_psc_present=psc_mode == PSC_PRESENT)
+# dataclasses.replace creates a fresh object, so copy the optional QC preference.
+settings.exclude_ambiguous_edge_candidates = bool(
+    getattr(base_settings, 'exclude_ambiguous_edge_candidates', False)
+)
 
 st.subheader('Image source')
 source = st.radio('Choose input source', ['AWS S3', 'Browser upload'], horizontal=True)
