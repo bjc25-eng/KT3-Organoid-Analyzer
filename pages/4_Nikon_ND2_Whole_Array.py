@@ -6,10 +6,13 @@ import pandas as pd
 import streamlit as st
 
 from analysis_core import BRIGHTFIELD_MODE, GFP_MODE, PSC_ABSENT, build_settings_from_widgets, zip_bytes
-from large_data_core import make_resume_bundle, process_large_experiment, restore_resume_bundle
+from large_data_core import make_resume_bundle, restore_resume_bundle
 from nd2_large_source import ND2_SOURCE_LABEL, install_nd2_dispatch, probe_nd2_source
+from nd2_physical_scan import install_nd2_physical_well_scan
+from nd2_qc import process_large_experiment_qc
 
 install_nd2_dispatch()
+install_nd2_physical_well_scan()
 
 st.set_page_config(page_title='Nikon ND2 Whole-Array Imaging', page_icon='🟢', layout='wide')
 st.title('Nikon ND2 Whole-Array Imaging')
@@ -25,6 +28,8 @@ with st.expander('How ND2 mode works', expanded=True):
 - If the file contains many normal microscope XY positions, each position can be analysed independently and efficiently.
 - If a single stitched ND2 frame itself is extremely large, the probe will flag it. In that case the recommended cloud workflow is a one-time conversion to chunked OME-Zarr before repeated analysis.
 - For your DIC + GFP data, use **GFP-labelled PDOs**, turn PSC/RFP analysis off, set the GFP channel to the fluorescence channel, and set the dedicated well-detection channel to DIC.
+- GFP PDOs use the same final QC logic as the validated OME-Zarr route: conservative shape-supported splitting, full-object segmentation, physical well-radius membership, segmented-object overlap, DIC wall evidence, ambiguous-edge classification and DIC microwell-validity QC.
+- Microwell detection is also physically calibrated from the ND2 pixel size: the Hough search uses 0.80–1.20× the expected 100-µm well radius and 1.50× radius minimum centre spacing, matching the validated whole-array benchmark.
 ''')
 
 st.warning(
@@ -113,7 +118,7 @@ with c:
 
 st.info('PSC/RFP analysis is disabled in this ND2 workflow because the current source type is DIC + GFP only.')
 
-st.subheader('3. Detection and memory settings')
+st.subheader('3. Detection, QC and memory settings')
 a, b, c = st.columns(3)
 with a:
     well_diameter = st.number_input('Microwell diameter (µm)', min_value=1.0, value=100.0, step=1.0)
@@ -123,10 +128,20 @@ with c:
     standard_crop = st.selectbox('ML crop size (px)', [128, 224, 256, 320, 512], index=2)
 
 split = st.checkbox('Split touching PDOs', True)
+exclude_ambiguous = st.checkbox(
+    'Exclude ambiguous wall-touching PDO candidates',
+    False,
+    help='Leave off for the first validation run. Ambiguous candidates will be retained but flagged in PDO_candidate_QC.csv.',
+)
+st.caption(
+    'Final-QC mode uses the physical pixel size stored in the ND2 metadata for well detection, PDO size and the 100-µm membership boundary. It stops with an explicit error if valid X/Y calibration is unavailable rather than estimating µm/px from detected Hough circles.'
+)
+
 with st.expander('Advanced detection thresholds'):
-    rmin = st.number_input('Minimum well radius (px)', 5, 1000, 23, step=1)
-    rmax = st.number_input('Maximum well radius (px)', 6, 2000, 40, step=1)
-    spacing = st.number_input('Minimum well spacing (px)', 10, 5000, 54, step=1)
+    st.caption('The radius and spacing values below are legacy UI fields; in native ND2 final-QC mode the actual Hough radius range and spacing are derived from the physical ND2 calibration. Well detection sensitivity and GFP thresholds remain active.')
+    rmin = st.number_input('Legacy minimum well radius (px; overridden in ND2 final-QC)', 5, 1000, 23, step=1)
+    rmax = st.number_input('Legacy maximum well radius (px; overridden in ND2 final-QC)', 6, 2000, 40, step=1)
+    spacing = st.number_input('Legacy minimum well spacing (px; overridden in ND2 final-QC)', 10, 5000, 54, step=1)
     hp2 = st.number_input('Well detection sensitivity', 1.0, 100.0, 27.0, 1.0)
     gl = st.number_input('GFP PDO low threshold', 0.0, 255.0, 30.0, 1.0)
     gh = st.number_input('GFP PDO high threshold', 0.0, 255.0, 45.0, 1.0)
@@ -138,6 +153,7 @@ settings = build_settings_from_widgets(
     9.0, 12.0, 4, 12, 10.0, 80,
     organoid_mode=GFP_MODE, rfp_psc_present=False
 )
+settings.exclude_ambiguous_edge_candidates = bool(exclude_ambiguous)
 
 # We map DIC to the dedicated well-detection channel and GFP to green. Red/blue
 # are absent so -1 gives a clean black background for the GFP composite.
@@ -158,7 +174,7 @@ if resume_file is not None and st.session_state.get('nd2_resume_name') != resume
         restored = restore_resume_bundle(resume_file.getvalue())
         st.session_state['nd2_work_root'] = str(restored)
         st.session_state['nd2_resume_name'] = resume_file.name
-        st.success('Resume bundle restored. Matching completed work will be skipped.')
+        st.success('Resume bundle restored. Physically calibrated well-scan checkpoints are reused only when their scan signature matches. Per-well measurements from an older QC schema are automatically recomputed.')
     except Exception as exc:
         st.error(f'Could not restore resume bundle: {exc}')
 
@@ -196,12 +212,12 @@ if run:
 
     def progress(done, total, phase):
         frac = int(min(99, max(1, 100 * done / max(1, total))))
-        label = 'Scanning DIC for microwells' if phase == 'well_scan' else 'Analysing GFP-positive PDOs'
+        label = 'Scanning DIC for microwells' if phase == 'well_scan' else 'Analysing GFP-positive PDOs with final QC'
         progress_bar.progress(frac, text=f'{label}: {done:,} / {total:,}')
         status.caption('Incremental checkpoints are being written throughout the run.')
 
     try:
-        root, out, manifest, wdf, pdf, pscdf, tracking, run_status, ml_path = process_large_experiment(
+        root, out, manifest, wdf, pdf, pscdf, tracking, run_status, ml_path = process_large_experiment_qc(
             [source], settings, channel_config,
             tile_size=int(tile_size), standard_crop_size=int(standard_crop),
             work_root=st.session_state.get('nd2_work_root'), progress_callback=progress,
@@ -213,10 +229,10 @@ if run:
         st.session_state['nd2_ml_zip'] = zip_bytes(ml_path) if ml_path is not None else None
         st.session_state['nd2_manifest'] = manifest.to_dict('records')
         st.session_state['nd2_run_status'] = run_status
-        progress_bar.progress(100, text='ND2 analysis pass complete.')
+        progress_bar.progress(100, text='ND2 final-QC analysis pass complete.')
         status.empty()
         if run_status.get('all_complete'):
-            st.success('Native ND2 analysis completed.')
+            st.success('Native ND2 analysis completed with final PDO/well QC.')
         else:
             st.warning('The run contains an incomplete/error source. Download the resume bundle before troubleshooting or restarting.')
     except Exception as exc:
@@ -232,6 +248,13 @@ if run:
 if st.session_state.get('nd2_run_status'):
     st.divider()
     st.subheader('ND2 outputs')
+    run_status = st.session_state['nd2_run_status']
+    a, b, c, d = st.columns(4)
+    a.metric('Outside-well rejected', int(run_status.get('qc_rejected_outside_well_candidates', 0)))
+    b.metric('Ambiguous candidates', int(run_status.get('qc_ambiguous_PDO_candidates', 0)))
+    c.metric('False-well candidates rejected', int(run_status.get('qc_rejected_false_well_candidates', 0)))
+    d.metric('False detected wells', int(run_status.get('qc_rejected_false_wells', 0)))
+
     a, b, c = st.columns(3)
     with a:
         if st.session_state.get('nd2_results_zip'):
@@ -246,5 +269,5 @@ if st.session_state.get('nd2_run_status'):
         st.dataframe(pd.DataFrame(st.session_state.get('nd2_manifest', [])), use_container_width=True, hide_index=True)
 
 st.caption(
-    'Native ND2 remains the archival source. For AWS, the next benchmark should use one representative ~3.5 GB DIC+GFP ND2 in private S3 and measure probe/frame size, wall time, RAM and cost.'
+    'Native ND2 remains the archival source. Validate one representative ~3 GB DIC+GFP ND2 first; after QC review, apply the unchanged settings to the remaining arrays.'
 )
