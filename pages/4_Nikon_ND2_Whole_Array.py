@@ -8,9 +8,11 @@ import streamlit as st
 from analysis_core import BRIGHTFIELD_MODE, GFP_MODE, PSC_ABSENT, build_settings_from_widgets, zip_bytes
 from large_data_core import make_resume_bundle, restore_resume_bundle
 from nd2_large_source import ND2_SOURCE_LABEL, install_nd2_dispatch, probe_nd2_source
+from nd2_physical_scan import install_nd2_physical_well_scan
 from nd2_qc import process_large_experiment_qc
 
 install_nd2_dispatch()
+install_nd2_physical_well_scan()
 
 st.set_page_config(page_title='Nikon ND2 Whole-Array Imaging', page_icon='🟢', layout='wide')
 st.title('Nikon ND2 Whole-Array Imaging')
@@ -27,6 +29,7 @@ with st.expander('How ND2 mode works', expanded=True):
 - If a single stitched ND2 frame itself is extremely large, the probe will flag it. In that case the recommended cloud workflow is a one-time conversion to chunked OME-Zarr before repeated analysis.
 - For your DIC + GFP data, use **GFP-labelled PDOs**, turn PSC/RFP analysis off, set the GFP channel to the fluorescence channel, and set the dedicated well-detection channel to DIC.
 - GFP PDOs use the same final QC logic as the validated OME-Zarr route: conservative shape-supported splitting, full-object segmentation, physical well-radius membership, segmented-object overlap, DIC wall evidence, ambiguous-edge classification and DIC microwell-validity QC.
+- Microwell detection is also physically calibrated from the ND2 pixel size: the Hough search uses 0.80–1.20× the expected 100-µm well radius and 1.50× radius minimum centre spacing, matching the validated whole-array benchmark.
 ''')
 
 st.warning(
@@ -131,13 +134,14 @@ exclude_ambiguous = st.checkbox(
     help='Leave off for the first validation run. Ambiguous candidates will be retained but flagged in PDO_candidate_QC.csv.',
 )
 st.caption(
-    'Final-QC mode uses the physical pixel size stored in the ND2 metadata. It will stop with an explicit error if valid X/Y calibration is unavailable rather than estimating µm/px from detected Hough circles.'
+    'Final-QC mode uses the physical pixel size stored in the ND2 metadata for well detection, PDO size and the 100-µm membership boundary. It stops with an explicit error if valid X/Y calibration is unavailable rather than estimating µm/px from detected Hough circles.'
 )
 
 with st.expander('Advanced detection thresholds'):
-    rmin = st.number_input('Minimum well radius (px)', 5, 1000, 23, step=1)
-    rmax = st.number_input('Maximum well radius (px)', 6, 2000, 40, step=1)
-    spacing = st.number_input('Minimum well spacing (px)', 10, 5000, 54, step=1)
+    st.caption('The radius and spacing values below are legacy UI fields; in native ND2 final-QC mode the actual Hough radius range and spacing are derived from the physical ND2 calibration. Well detection sensitivity and GFP thresholds remain active.')
+    rmin = st.number_input('Legacy minimum well radius (px; overridden in ND2 final-QC)', 5, 1000, 23, step=1)
+    rmax = st.number_input('Legacy maximum well radius (px; overridden in ND2 final-QC)', 6, 2000, 40, step=1)
+    spacing = st.number_input('Legacy minimum well spacing (px; overridden in ND2 final-QC)', 10, 5000, 54, step=1)
     hp2 = st.number_input('Well detection sensitivity', 1.0, 100.0, 27.0, 1.0)
     gl = st.number_input('GFP PDO low threshold', 0.0, 255.0, 30.0, 1.0)
     gh = st.number_input('GFP PDO high threshold', 0.0, 255.0, 45.0, 1.0)
@@ -170,7 +174,7 @@ if resume_file is not None and st.session_state.get('nd2_resume_name') != resume
         restored = restore_resume_bundle(resume_file.getvalue())
         st.session_state['nd2_work_root'] = str(restored)
         st.session_state['nd2_resume_name'] = resume_file.name
-        st.success('Resume bundle restored. Matching tile/well detection work will be reused. Per-well measurements from an older QC schema are automatically recomputed.')
+        st.success('Resume bundle restored. Physically calibrated well-scan checkpoints are reused only when their scan signature matches. Per-well measurements from an older QC schema are automatically recomputed.')
     except Exception as exc:
         st.error(f'Could not restore resume bundle: {exc}')
 
