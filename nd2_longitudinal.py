@@ -111,6 +111,41 @@ def _apply_native_scale(df: pd.DataFrame, scales_by_timepoint: dict[int, float])
     return out
 
 
+def _recalibrate_tracking(ldf: pd.DataFrame, scales_by_timepoint: dict[int, float]) -> pd.DataFrame:
+    """Compatibility helper retained for existing ND2 tests and callers."""
+    out = ldf.copy()
+    if out.empty or "timepoint_index" not in out.columns:
+        return out
+    target_scale = out["timepoint_index"].map(scales_by_timepoint).astype(float)
+    old_scale = pd.to_numeric(out.get("um_per_pixel"), errors="coerce")
+    valid = target_scale.notna() & (target_scale > 0) & old_scale.notna() & (old_scale > 0)
+    if "total_PDO_projected_area_um2" in out.columns:
+        px_area = np.where(
+            valid,
+            pd.to_numeric(out["total_PDO_projected_area_um2"], errors="coerce") / (old_scale ** 2),
+            np.nan,
+        )
+        out.loc[valid, "total_PDO_projected_area_um2"] = px_area[valid] * (target_scale[valid] ** 2)
+    for col in ("mean_PDO_diameter_um", "max_PDO_diameter_um"):
+        if col in out.columns:
+            vals = pd.to_numeric(out[col], errors="coerce")
+            out.loc[valid, col] = vals[valid] * target_scale[valid] / old_scale[valid]
+    out.loc[valid, "um_per_pixel"] = target_scale[valid]
+    if "trajectory_id" in out.columns and "total_PDO_projected_area_um2" in out.columns:
+        baseline = (
+            out.sort_values("timepoint_index")
+            .groupby("trajectory_id", as_index=False)
+            .first()[["trajectory_id", "total_PDO_projected_area_um2"]]
+            .rename(columns={"total_PDO_projected_area_um2": "baseline_total_PDO_area_um2"})
+        )
+        out = out.drop(columns=["baseline_total_PDO_area_um2", "relative_total_PDO_area_vs_baseline"], errors="ignore")
+        out = out.merge(baseline, on="trajectory_id", how="left", validate="many_to_one")
+        base = pd.to_numeric(out["baseline_total_PDO_area_um2"], errors="coerce")
+        cur = pd.to_numeric(out["total_PDO_projected_area_um2"], errors="coerce")
+        out["relative_total_PDO_area_vs_baseline"] = np.where(base > 0, cur / base, np.nan)
+    return out
+
+
 def process_paired_nd2_longitudinal(
     friday_uri: str,
     monday_uri: str,
