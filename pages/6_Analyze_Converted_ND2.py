@@ -8,12 +8,14 @@ import pandas as pd
 import streamlit as st
 
 import large_data_core as ldc
-from analysis_core import GFP_MODE, build_settings_from_widgets, detect_wells, zip_bytes
+from analysis_core import GFP_MODE, build_settings_from_widgets, zip_bytes
 from nd2_omezarr import probe_omezarr
 from omezarr_nd2_bridge import (
     calibrated_scan_settings,
+    detect_wells_converted_dic,
     infer_channel_indices,
     install_converted_nd2_bridge,
+    local_contrast_dic,
     process_converted_nd2_omezarr_qc,
 )
 
@@ -152,8 +154,9 @@ channel_config = {
 
 st.subheader('4. DIC diagnostic preview')
 st.caption(
-    'Before another full-array run, sample nine real 1024×1024 DIC regions across the stitched image. '
-    'Red circles are the microwells detected with the current physical radius and Hough sensitivity.'
+    'Sample nine real 1024×1024 DIC regions. The preview now uses the exact same '
+    'local-contrast physical-radius detector as the converted whole-array run. '
+    'Red circles are detected microwells.'
 )
 
 if st.button('Generate DIC diagnostic preview', use_container_width=True):
@@ -181,8 +184,9 @@ if st.button('Generate DIC diagnostic preview', use_container_width=True):
                         int(dic_channel), 0, 0,
                     )
                     dic_rgb = np.stack([dic, dic, dic], axis=-1)
-                    circles = detect_wells(dic_rgb, settings)
-                    overlay = dic_rgb.copy()
+                    circles = detect_wells_converted_dic(dic_rgb, settings)
+                    enhanced = local_contrast_dic(dic_rgb)
+                    overlay = np.stack([enhanced, enhanced, enhanced], axis=-1)
                     for cx, cy, radius in circles:
                         cv2.circle(
                             overlay,
@@ -209,7 +213,7 @@ if st.button('Generate DIC diagnostic preview', use_container_width=True):
                             overlay,
                             caption=(
                                 f'x={int(x0):,}, y={int(y0):,} · '
-                                f'{len(circles)} wells · DIC p1/p99={p1:.0f}/{p99:.0f}'
+                                f'{len(circles)} wells · raw DIC p1/p99={p1:.0f}/{p99:.0f}'
                             ),
                             use_container_width=True,
                         )
@@ -220,8 +224,8 @@ if st.button('Generate DIC diagnostic preview', use_container_width=True):
             st.success(f'Diagnostic preview detected {total_preview_wells} candidate microwells across the nine sampled regions.')
         else:
             st.warning(
-                'The current detector found zero wells in all diagnostic regions. '
-                'Do not run the full array again yet; inspect these DIC tiles first.'
+                'The converted-ND2 detector found zero wells in all diagnostic regions. '
+                'Do not run the full array again yet.'
             )
     except Exception as exc:
         st.error(f'DIC diagnostic failed: {type(exc).__name__}: {exc!s}')
