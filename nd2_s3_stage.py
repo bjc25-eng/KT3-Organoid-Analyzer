@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 from pathlib import Path
 from typing import Callable
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 
 
@@ -82,6 +84,11 @@ def stage_s3_nd2(
 
     A completed file is reused when its size matches the current S3 object. A
     partial download is written to ``.part`` and never mistaken for a valid ND2.
+
+    Boto3 transfer worker threads are deliberately disabled here. Streamlit UI
+    progress callbacks require the active Streamlit script context, so invoking
+    them from boto3 ThreadPoolExecutor workers can produce missing-ScriptRunContext
+    errors on EC2.
     """
     head = client.head_object(Bucket=bucket, Key=key)
     size = int(head.get('ContentLength', 0) or 0)
@@ -102,6 +109,13 @@ def stage_s3_nd2(
             's3_uri': f's3://{bucket}/{key}',
         }
 
+    free_bytes = int(shutil.disk_usage(local_path.parent).free)
+    if free_bytes < size:
+        raise OSError(
+            f'Insufficient local disk space to stage ND2: object is {size / (1024 ** 3):.2f} GiB '
+            f'but only {free_bytes / (1024 ** 3):.2f} GiB is free at {local_path.parent}.'
+        )
+
     part_path = local_path.with_suffix(local_path.suffix + '.part')
     if part_path.exists():
         part_path.unlink()
@@ -114,17 +128,30 @@ def stage_s3_nd2(
         if progress_callback:
             progress_callback(min(transferred, size), size)
 
+    # Single-threaded transfer keeps the callback in the Streamlit script
+    # context. Multipart download still works; only boto3's worker pool is off.
+    transfer_config = TransferConfig(use_threads=False)
+
     try:
-        client.download_file(bucket, key, str(part_path), Callback=_progress)
+        client.download_file(
+            bucket,
+            key,
+            str(part_path),
+            Callback=_progress,
+            Config=transfer_config,
+        )
         if part_path.stat().st_size != size:
             raise IOError(
                 f'S3 download size mismatch for {key}: expected {size} bytes, got {part_path.stat().st_size}.'
             )
         os.replace(part_path, local_path)
-    except Exception:
+    except Exception as exc:
         if part_path.exists():
             part_path.unlink()
-        raise
+        # Some lower-level transfer exceptions stringify to an empty string.
+        # Always propagate a useful diagnostic to the Streamlit error panel.
+        detail = str(exc).strip() or repr(exc)
+        raise RuntimeError(f'{type(exc).__name__}: {detail}') from exc
 
     return {
         'local_path': str(local_path),
