@@ -7,24 +7,21 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from scipy.ndimage import gaussian_filter
 
 import large_data_core as ldc
 from nd2_qc import process_large_experiment_qc
-from well_qc import WELL_VALIDITY_SCORE_THRESHOLD, assess_microwell_boundary
 
 _ORIGINAL_METADATA = None
 _ORIGINAL_READ_CHANNEL = None
 _ORIGINAL_DETECT_WELLS = None
 SCALING_SCHEMA_VERSION = 'nd2-omezarr-window-scaling-v2'
-DETECTOR_SCHEMA_VERSION = 'nd2-omezarr-local-contrast-hough-wall-coherence-v3'
+DETECTOR_SCHEMA_VERSION = 'nd2-omezarr-array-contour-gate-hough-v5'
 
-# For a centred regular hexagon, radial wall distance varies from apothem to
-# circumradius. Across angle, the IQR of radius / circumradius is ~0.064.
-# Allow ~2x that geometric variation for rounded/irregular real wells.
-WALL_RADIUS_IQR_FRACTION_MAX = 0.13
-WALL_COHERENCE_ANGLE_COUNT = 72
-WALL_COHERENCE_RADIAL_COUNT = 100
+# The array gate is intentionally tile-level. It decides only whether a tile
+# contains several closed structures with the physical size of a 100-um well.
+# Once a tile is accepted, the same local-contrast physical-radius Hough detector
+# that worked on the original single-array tiles is used without a per-well veto.
+ARRAY_MIN_WELL_LIKE_CONTOURS = 4
 
 
 def _unit_to_um(value: float, unit: str | None) -> float | None:
@@ -67,7 +64,6 @@ def _display_window(reader, channel: int) -> tuple[float, float] | None:
     window = channels[idx].get('window') or {}
     if not isinstance(window, dict):
         return None
-
     low = window.get('start', window.get('min'))
     high = window.get('end', window.get('max'))
     try:
@@ -81,18 +77,15 @@ def _display_window(reader, channel: int) -> tuple[float, float] | None:
 
 
 def install_omezarr_physical_metadata() -> None:
-    """Expose OME-NGFF calibration/channel metadata to the final-QC engine."""
     global _ORIGINAL_METADATA
     if getattr(ldc.LargeImageReader.metadata, '_omezarr_physical_metadata_wrapper', False):
         return
-
     _ORIGINAL_METADATA = ldc.LargeImageReader.metadata
 
     def wrapped(self):
         payload = _ORIGINAL_METADATA(self)
         if str(getattr(self, 'format', '')) != 'OME-Zarr' or getattr(self, '_root', None) is None:
             return payload
-
         try:
             attrs = dict(self._root.attrs)
             multiscales = attrs.get('multiscales') or []
@@ -102,7 +95,6 @@ def install_omezarr_physical_metadata() -> None:
             datasets = ms.get('datasets') or []
             if not datasets:
                 return payload
-
             level = min(max(0, int(getattr(self, 'level', 0))), len(datasets) - 1)
             dataset = datasets[level]
             axes_meta = ms.get('axes') or []
@@ -159,11 +151,9 @@ def install_omezarr_physical_metadata() -> None:
 
 
 def install_omezarr_window_scaled_reads() -> None:
-    """Scale ND2-derived OME-Zarr planes with each OME display window."""
     global _ORIGINAL_READ_CHANNEL
     if getattr(ldc.LargeImageReader.read_channel_region, '_omezarr_window_scaled_wrapper', False):
         return
-
     _ORIGINAL_READ_CHANNEL = ldc.LargeImageReader.read_channel_region
 
     def wrapped(self, x0: int, y0: int, width: int, height: int, channel: int = 0,
@@ -172,7 +162,6 @@ def install_omezarr_window_scaled_reads() -> None:
             return _ORIGINAL_READ_CHANNEL(
                 self, x0, y0, width, height, channel, z_index, t_index
             )
-
         x0_i = max(0, int(x0))
         y0_i = max(0, int(y0))
         x1_i = min(self.width, x0_i + max(1, int(width)))
@@ -182,8 +171,7 @@ def install_omezarr_window_scaled_reads() -> None:
             x0_i, y0_i, x1_i, y1_i, ch, z_index, t_index
         )
         if selector is None:
-            return np.zeros((y1_i - y0_i, x1_i - x0_i), dtype=np.uint8)
-
+            return np.zeros((y1_i-y0_i, x1_i-x0_i), dtype=np.uint8)
         arr = np.asarray(self.array[selector])
         arr = np.squeeze(arr)
         if arr.ndim != 2:
@@ -192,14 +180,12 @@ def install_omezarr_window_scaled_reads() -> None:
             )
         if remaining == ['X', 'Y']:
             arr = arr.T
-
         window = _display_window(self, ch)
         if window is None:
             return ldc._to_uint8(arr)
-
         low, high = window
         work = arr.astype(np.float32, copy=False)
-        scaled = (work - float(low)) * (255.0 / float(high - low))
+        scaled = (work - float(low)) * (255.0 / float(high-low))
         return np.clip(scaled, 0.0, 255.0).astype(np.uint8)
 
     wrapped._omezarr_window_scaled_wrapper = True
@@ -207,7 +193,7 @@ def install_omezarr_window_scaled_reads() -> None:
 
 
 def local_contrast_dic(rgb: np.ndarray) -> np.ndarray:
-    """Locally stretch a DIC tile for Hough candidate generation only."""
+    """Local DIC stretch used to reproduce the successful single-tile input contrast."""
     gray = cv2.cvtColor(np.asarray(rgb, dtype=np.uint8), cv2.COLOR_RGB2GRAY)
     finite = gray[np.isfinite(gray)]
     if finite.size == 0:
@@ -215,16 +201,88 @@ def local_contrast_dic(rgb: np.ndarray) -> np.ndarray:
     low, high = np.percentile(finite, [1.0, 99.0])
     if not np.isfinite(low) or not np.isfinite(high) or float(high) <= float(low) + 1.0:
         return gray
-    work = gray.astype(np.float32)
-    work = (work - float(low)) * (255.0 / float(high - low))
+    work = (gray.astype(np.float32) - float(low)) * (255.0 / float(high-low))
     return np.clip(work, 0.0, 255.0).astype(np.uint8)
 
 
+def _well_like_closed_contours(rgb: np.ndarray, settings) -> list[dict]:
+    """Return closed dark contours whose geometry is compatible with a microwell.
+
+    This is used only to decide whether the tile belongs to the physical array.
+    It is not used to alter individual Hough well centres.
+    """
+    gray = local_contrast_dic(rgb)
+    rref = 0.5 * (float(settings.well_rmin) + float(settings.well_rmax))
+    if rref <= 2:
+        return []
+
+    # Adaptive thresholding is insensitive to broad illumination gradients in the
+    # stitched DIC image while retaining the dark closed well walls.
+    block = max(31, int(round(1.7 * rref)))
+    if block % 2 == 0:
+        block += 1
+    bw = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        block,
+        3,
+    )
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8))
+    contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    min_wh = 1.25 * rref
+    max_wh = 2.80 * rref
+    min_area = 0.25 * math.pi * rref * rref
+    max_area = 1.85 * math.pi * rref * rref
+    out = []
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        perimeter = float(cv2.arcLength(contour, True))
+        if perimeter <= 0:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        circularity = float(4.0 * math.pi * area / (perimeter * perimeter))
+        if not (min_wh <= float(w) <= max_wh and min_wh <= float(h) <= max_wh):
+            continue
+        if not (min_area <= area <= max_area):
+            continue
+        if circularity < 0.20:
+            continue
+        m = cv2.moments(contour)
+        if abs(float(m.get('m00', 0.0))) > 1e-9:
+            cx = float(m['m10'] / m['m00'])
+            cy = float(m['m01'] / m['m00'])
+        else:
+            cx = float(x + w/2.0)
+            cy = float(y + h/2.0)
+        out.append({
+            'x': cx,
+            'y': cy,
+            'width': int(w),
+            'height': int(h),
+            'area': area,
+            'circularity': circularity,
+        })
+    return out
+
+
+def is_array_tile_converted_dic(rgb: np.ndarray, settings) -> tuple[bool, dict]:
+    contours = _well_like_closed_contours(rgb, settings)
+    count = int(len(contours))
+    return count >= ARRAY_MIN_WELL_LIKE_CONTOURS, {
+        'array_tile': bool(count >= ARRAY_MIN_WELL_LIKE_CONTOURS),
+        'well_like_closed_contours': count,
+        'required_well_like_closed_contours': int(ARRAY_MIN_WELL_LIKE_CONTOURS),
+    }
+
+
 def _hough_candidates_converted_dic(rgb: np.ndarray, settings) -> np.ndarray:
+    """Physical-radius Hough detector used on accepted array tiles."""
     rmin = max(1, int(round(settings.well_rmin)))
     rmax = max(rmin + 1, int(round(settings.well_rmax)))
     spacing = max(1, int(round(settings.well_spacing)))
-
     gray = local_contrast_dic(rgb)
     blur = cv2.GaussianBlur(gray, (7, 7), 1.5)
     circles = cv2.HoughCircles(
@@ -239,160 +297,36 @@ def _hough_candidates_converted_dic(rgb: np.ndarray, settings) -> np.ndarray:
     )
     if circles is None:
         return np.empty((0, 3), dtype=int)
-
     circles = np.round(circles[0]).astype(int)
     kept = []
     for x, y, radius in circles[np.argsort(circles[:, 0])]:
-        if all((x - a) ** 2 + (y - b) ** 2 > 20 ** 2 for a, b, _ in kept):
+        if all((x-a)**2 + (y-b)**2 > 20**2 for a, b, _ in kept):
             kept.append((int(x), int(y), int(radius)))
     return np.asarray(kept, dtype=int)
 
 
-def assess_wall_radial_coherence(
-    rgb: np.ndarray,
-    well_x: float,
-    well_y: float,
-    well_r: float,
-) -> dict:
-    """Test whether dark wall troughs occur at a coherent radius around the centre.
-
-    This complements the existing wall-darkness score. A genuine circular or
-    hexagonal microwell has a continuous wall whose radial position changes
-    smoothly with angle. Background texture may provide dark pixels on many
-    rays, but their radial positions are scattered across the search annulus.
-    """
-    if well_r <= 0 or np.asarray(rgb).size == 0:
-        return {
-            'wall_radius_iqr_fraction': float('nan'),
-            'wall_radius_iqr_fraction_max': WALL_RADIUS_IQR_FRACTION_MAX,
-            'wall_radius_median_fraction': float('nan'),
-            'wall_radial_coherence_status': 'not_evaluable',
-        }
-
-    a = np.asarray(rgb)
-    if a.ndim == 3 and a.shape[2] >= 3:
-        dic = (a[..., 0].astype(np.float32) + a[..., 2].astype(np.float32)) / 2.0
-    else:
-        dic = a.astype(np.float32)
-    dic = gaussian_filter(dic, 1.0)
-
-    radii = np.linspace(
-        0.72 * float(well_r),
-        1.10 * float(well_r),
-        WALL_COHERENCE_RADIAL_COUNT,
-    )
-    trough_radii = []
-    for theta in np.linspace(0.0, 2.0 * math.pi, WALL_COHERENCE_ANGLE_COUNT, endpoint=False):
-        xs = float(well_x) + radii * math.cos(float(theta))
-        ys = float(well_y) + radii * math.sin(float(theta))
-        xi = np.clip(np.rint(xs).astype(int), 0, dic.shape[1] - 1)
-        yi = np.clip(np.rint(ys).astype(int), 0, dic.shape[0] - 1)
-        profile = dic[yi, xi]
-        trough_radii.append(float(radii[int(np.argmin(profile))]))
-
-    trough = np.asarray(trough_radii, dtype=float)
-    if trough.size < 24 or not np.all(np.isfinite(trough)):
-        return {
-            'wall_radius_iqr_fraction': float('nan'),
-            'wall_radius_iqr_fraction_max': WALL_RADIUS_IQR_FRACTION_MAX,
-            'wall_radius_median_fraction': float('nan'),
-            'wall_radial_coherence_status': 'not_evaluable',
-        }
-
-    q25, median_r, q75 = np.percentile(trough, [25.0, 50.0, 75.0])
-    iqr_fraction = float((q75 - q25) / float(well_r))
-    median_fraction = float(median_r / float(well_r))
-    status = 'accepted' if iqr_fraction <= WALL_RADIUS_IQR_FRACTION_MAX else 'rejected_incoherent_wall_radius'
-    return {
-        'wall_radius_iqr_fraction': iqr_fraction,
-        'wall_radius_iqr_fraction_max': WALL_RADIUS_IQR_FRACTION_MAX,
-        'wall_radius_median_fraction': median_fraction,
-        'wall_radial_coherence_status': status,
-    }
-
-
 def detect_wells_converted_dic_with_qc(rgb: np.ndarray, settings) -> tuple[np.ndarray, list[dict]]:
-    """Generate Hough candidates then require DIC darkness and radial coherence."""
-    candidates = _hough_candidates_converted_dic(rgb, settings)
-    if len(candidates) == 0:
-        return np.empty((0, 3), dtype=int), []
-
-    calibrated_radius = 0.5 * (float(settings.well_rmin) + float(settings.well_rmax))
-    required_margin = 1.35 * calibrated_radius
-    height, width = np.asarray(rgb).shape[:2]
-    accepted = []
-    rows: list[dict] = []
-
-    for x, y, detected_radius in candidates:
-        if (
-            float(x) < required_margin
-            or float(y) < required_margin
-            or float(x) >= float(width) - required_margin
-            or float(y) >= float(height) - required_margin
-        ):
-            rows.append({
-                'x': int(x),
-                'y': int(y),
-                'detected_radius_px': int(detected_radius),
-                'wall_reference_radius_px': float(calibrated_radius),
-                'well_validity_status': 'rejected_tile_edge',
-                'well_validity_reason': 'candidate wall cannot be fully evaluated inside this scan tile',
-                'well_wall_evidence_score': float('nan'),
-                'well_wall_evidence_threshold': float(
-                    getattr(settings, 'well_validity_score_threshold', WELL_VALIDITY_SCORE_THRESHOLD)
-                ),
-                'wall_radius_iqr_fraction': float('nan'),
-                'wall_radius_iqr_fraction_max': WALL_RADIUS_IQR_FRACTION_MAX,
-                'wall_radius_median_fraction': float('nan'),
-                'wall_radial_coherence_status': 'not_evaluable',
-                'accepted_by_converted_detector': False,
-            })
-            continue
-
-        wall_qc = assess_microwell_boundary(
-            rgb,
-            well_x=float(x),
-            well_y=float(y),
-            well_r=float(calibrated_radius),
-            settings=settings,
-        )
-        coherence = assess_wall_radial_coherence(
-            rgb,
-            well_x=float(x),
-            well_y=float(y),
-            well_r=float(calibrated_radius),
-        )
-        score = wall_qc.get('well_wall_evidence_score', float('nan'))
-        is_accepted = (
-            str(wall_qc.get('well_validity_status', '')) == 'accepted'
-            and np.isfinite(float(score))
-            and coherence.get('wall_radial_coherence_status') == 'accepted'
-        )
-        reason = str(wall_qc.get('well_validity_reason', ''))
-        if str(wall_qc.get('well_validity_status', '')) == 'accepted' and not is_accepted:
-            reason = 'DIC wall is dark enough but its radial position is not coherent around the candidate centre'
-
-        row = {
+    """Skip non-array tiles, then retain the original Hough detections unchanged."""
+    array_tile, tile_qc = is_array_tile_converted_dic(rgb, settings)
+    if not array_tile:
+        return np.empty((0, 3), dtype=int), [tile_qc]
+    circles = _hough_candidates_converted_dic(rgb, settings)
+    rows = [
+        {
             'x': int(x),
             'y': int(y),
-            'detected_radius_px': int(detected_radius),
-            'wall_reference_radius_px': float(calibrated_radius),
-            **wall_qc,
-            **coherence,
-            'accepted_by_converted_detector': bool(is_accepted),
-            'converted_detector_reason': reason,
+            'detected_radius_px': int(r),
+            'accepted_by_converted_detector': True,
+            **tile_qc,
         }
-        rows.append(row)
-        if is_accepted:
-            accepted.append((int(x), int(y), int(detected_radius)))
-
-    return np.asarray(accepted, dtype=int).reshape((-1, 3)), rows
+        for x, y, r in circles
+    ]
+    return circles, rows
 
 
 def detect_wells_converted_dic(rgb: np.ndarray, settings) -> np.ndarray:
-    """Converted-ND2 microwell detector used by the whole-array scan."""
-    accepted, _ = detect_wells_converted_dic_with_qc(rgb, settings)
-    return accepted
+    circles, _ = detect_wells_converted_dic_with_qc(rgb, settings)
+    return circles
 
 
 def install_converted_nd2_bridge() -> None:
@@ -401,7 +335,6 @@ def install_converted_nd2_bridge() -> None:
 
 
 def calibrated_scan_settings(settings, converted_meta: dict):
-    """Return Settings using physical 100-µm microwell Hough geometry."""
     voxel = converted_meta.get('voxel_size_um') or {}
     values = []
     for key in ('x', 'y'):
@@ -415,7 +348,6 @@ def calibrated_scan_settings(settings, converted_meta: dict):
         raise ValueError(
             'Converted OME-Zarr does not contain valid X/Y physical pixel calibration.'
         )
-
     um_per_pixel = float(np.mean(values))
     expected_radius_px = float(settings.well_diameter_um) / (2.0 * um_per_pixel)
     derived = copy.copy(settings)
@@ -426,10 +358,8 @@ def calibrated_scan_settings(settings, converted_meta: dict):
 
 
 def process_converted_nd2_omezarr_qc(*args, **kwargs):
-    """Run final QC on an ND2-derived OME-Zarr with route-local well detection."""
     global _ORIGINAL_DETECT_WELLS
     install_converted_nd2_bridge()
-
     old_detector = ldc.detect_wells
     _ORIGINAL_DETECT_WELLS = old_detector
     ldc.detect_wells = detect_wells_converted_dic
@@ -453,13 +383,10 @@ def process_converted_nd2_omezarr_qc(*args, **kwargs):
             )
             final_qc['channel_scaling_schema'] = SCALING_SCHEMA_VERSION
             final_qc['well_detector'] = (
-                'local-contrast physical-radius Hough candidates followed by original-DIC wall-darkness and geometry-derived radial-coherence QC'
+                'tile-level closed-contour array-region gate followed by unchanged local-contrast physical-radius Hough detection'
             )
             final_qc['well_detector_schema'] = DETECTOR_SCHEMA_VERSION
-            final_qc['well_wall_evidence_threshold'] = float(
-                getattr(args[1] if len(args) > 1 else None, 'well_validity_score_threshold', WELL_VALIDITY_SCORE_THRESHOLD)
-            )
-            final_qc['wall_radius_iqr_fraction_max'] = WALL_RADIUS_IQR_FRACTION_MAX
+            final_qc['array_tile_min_closed_contours'] = ARRAY_MIN_WELL_LIKE_CONTOURS
             config_path.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
         except Exception:
             pass
