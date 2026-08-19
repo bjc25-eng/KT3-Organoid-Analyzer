@@ -77,8 +77,6 @@ def find_bioformats2raw(explicit: str | Path | None = None) -> Path:
 
 def conversion_paths(input_nd2: str | Path) -> tuple[Path, Path, Path]:
     src = Path(input_nd2).expanduser().resolve()
-    # Staged files live under <object-token>/input/<name>.nd2. Keep the converted
-    # representation beside input/work so it survives Streamlit restarts.
     object_root = src.parent.parent
     converted_root = object_root / "converted"
     output = converted_root / f"{src.stem}.ome.zarr"
@@ -86,8 +84,41 @@ def conversion_paths(input_nd2: str | Path) -> tuple[Path, Path, Path]:
     return output, marker, object_root / "bf2raw_tmp"
 
 
+def normalise_zarr_java_v2_blosc_metadata(path: str | Path) -> int:
+    """Remove zarr-java's V2-only ``typesize`` Blosc config key.
+
+    Current zarr-java writes ``typesize`` into Zarr V2 Blosc compressor metadata.
+    The Python environment used by this app intentionally retains an older
+    numcodecs release for Zarr 2 compatibility, and that release cannot construct
+    ``Blosc(..., typesize=...)``.  The encoded Blosc chunks themselves contain
+    the information required for decompression, so dropping this metadata-only
+    key restores interoperability without touching pixel data.
+    """
+    root = Path(path).expanduser().resolve()
+    changed = 0
+    for metadata_path in root.rglob(".zarray"):
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        compressor = payload.get("compressor")
+        if not isinstance(compressor, dict):
+            continue
+        if str(compressor.get("id", "")).lower() != "blosc":
+            continue
+        if "typesize" not in compressor:
+            continue
+        compressor.pop("typesize", None)
+        tmp = metadata_path.with_name(metadata_path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        tmp.replace(metadata_path)
+        changed += 1
+    return changed
+
+
 def probe_omezarr(path: str | Path) -> dict:
-    root = zarr.open_group(str(Path(path).expanduser().resolve()), mode="r")
+    resolved = Path(path).expanduser().resolve()
+    root = zarr.open_group(str(resolved), mode="r")
     attrs = dict(root.attrs)
     multiscales = attrs.get("multiscales") or []
     if not multiscales:
@@ -128,7 +159,11 @@ def probe_omezarr(path: str | Path) -> dict:
     if scale is not None:
         for spatial_axis in ("X", "Y"):
             idx = axes.index(spatial_axis)
-            axis_meta = axes_meta[idx] if idx < len(axes_meta) and isinstance(axes_meta[idx], dict) else {}
+            axis_meta = (
+                axes_meta[idx]
+                if idx < len(axes_meta) and isinstance(axes_meta[idx], dict)
+                else {}
+            )
             value_um = _unit_to_um(scale[idx], axis_meta.get("unit"))
             if value_um is not None:
                 voxel_size_um[spatial_axis.lower()] = float(value_um)
@@ -146,8 +181,17 @@ def probe_omezarr(path: str | Path) -> dict:
             }
         )
 
+    # Force one real chunk decode, not just metadata parsing, before accepting the
+    # conversion. A scalar read touches only the first relevant chunk.
+    sample_index = tuple(0 for _ in arr.shape)
+    sample_value = arr[sample_index]
+    try:
+        sample_value = sample_value.item()
+    except AttributeError:
+        pass
+
     return {
-        "path": str(Path(path).expanduser().resolve()),
+        "path": str(resolved),
         "format": "OME-Zarr",
         "shape": [int(v) for v in arr.shape],
         "axes": axes,
@@ -160,6 +204,8 @@ def probe_omezarr(path: str | Path) -> dict:
         "level_count": len(datasets),
         "level0_array_path": array_path,
         "level0_chunks": [int(v) for v in arr.chunks],
+        "chunk_decode_test": "passed",
+        "sample_value": sample_value,
     }
 
 
@@ -167,7 +213,11 @@ def validate_against_nd2(zarr_meta: dict, nd2_meta: dict) -> dict:
     errors: list[str] = []
     warnings: list[str] = []
 
-    for key, label in (("width_px", "width"), ("height_px", "height"), ("channel_count", "channel count")):
+    for key, label in (
+        ("width_px", "width"),
+        ("height_px", "height"),
+        ("channel_count", "channel count"),
+    ):
         expected = int(nd2_meta.get(key, 0) or 0)
         actual = int(zarr_meta.get(key, 0) or 0)
         if expected and actual != expected:
@@ -210,6 +260,29 @@ def validate_against_nd2(zarr_meta: dict, nd2_meta: dict) -> dict:
     return {"ok": not errors, "errors": errors, "warnings": warnings}
 
 
+def _write_marker(
+    marker: Path,
+    *,
+    src: Path,
+    output: Path,
+    series_index: int,
+    command: list[str],
+    meta: dict,
+    validation: dict,
+    compatibility_fixes: int,
+) -> None:
+    payload = {
+        "input_nd2": str(src),
+        "output_omezarr": str(output),
+        "series_index": int(series_index),
+        "command": command,
+        "metadata": meta,
+        "validation": validation,
+        "zarr_java_blosc_typesize_metadata_removed": int(compatibility_fixes),
+    }
+    marker.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
 def convert_nd2_to_omezarr(
     input_nd2: str | Path,
     nd2_meta: dict,
@@ -230,17 +303,35 @@ def convert_nd2_to_omezarr(
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    if output.exists() and marker.exists() and not overwrite:
-        meta = probe_omezarr(output)
-        validation = validate_against_nd2(meta, nd2_meta)
-        if validation["ok"]:
-            return {
-                "output_path": str(output),
-                "reused": True,
-                "metadata": meta,
-                "validation": validation,
-                "command": [],
-            }
+    # Recover a completed bioformats2raw output even if the previous app version
+    # failed during Python-side validation and therefore never wrote its marker.
+    if output.exists() and not overwrite:
+        compatibility_fixes = normalise_zarr_java_v2_blosc_metadata(output)
+        try:
+            meta = probe_omezarr(output)
+            validation = validate_against_nd2(meta, nd2_meta)
+            if validation["ok"]:
+                _write_marker(
+                    marker,
+                    src=src,
+                    output=output,
+                    series_index=series_index,
+                    command=[],
+                    meta=meta,
+                    validation=validation,
+                    compatibility_fixes=compatibility_fixes,
+                )
+                return {
+                    "output_path": str(output),
+                    "reused": True,
+                    "metadata": meta,
+                    "validation": validation,
+                    "command": [],
+                    "compatibility_fixes": compatibility_fixes,
+                }
+        except Exception:
+            # If this is genuinely partial/corrupt, fall through to a clean rebuild.
+            pass
 
     if output.exists():
         shutil.rmtree(output)
@@ -272,7 +363,6 @@ def convert_nd2_to_omezarr(
 
     env = os.environ.copy()
     total_memory = system_memory_bytes()
-    # Keep headroom for the OS, Streamlit and native Bio-Formats libraries.
     if total_memory > 0:
         heap_mib = min(6144, max(1024, int((total_memory * 0.70) / (1024 ** 2))))
         existing = env.get("JAVA_OPTS", "").strip()
@@ -303,6 +393,7 @@ def convert_nd2_to_omezarr(
             f"bioformats2raw exited with code {return_code}. Last output:\n{tail}"
         )
 
+    compatibility_fixes = normalise_zarr_java_v2_blosc_metadata(output)
     meta = probe_omezarr(output)
     validation = validate_against_nd2(meta, nd2_meta)
     if not validation["ok"]:
@@ -311,19 +402,21 @@ def convert_nd2_to_omezarr(
             + "; ".join(validation["errors"])
         )
 
-    payload = {
-        "input_nd2": str(src),
-        "output_omezarr": str(output),
-        "series_index": int(series_index),
-        "command": command,
-        "metadata": meta,
-        "validation": validation,
-    }
-    marker.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    _write_marker(
+        marker,
+        src=src,
+        output=output,
+        series_index=series_index,
+        command=command,
+        meta=meta,
+        validation=validation,
+        compatibility_fixes=compatibility_fixes,
+    )
     return {
         "output_path": str(output),
         "reused": False,
         "metadata": meta,
         "validation": validation,
         "command": command,
+        "compatibility_fixes": compatibility_fixes,
     }
