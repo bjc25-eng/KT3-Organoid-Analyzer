@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from pathlib import Path
 
 import cv2
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
 import large_data_core as ldc
 from nd2_qc import process_large_experiment_qc
@@ -15,7 +17,14 @@ _ORIGINAL_METADATA = None
 _ORIGINAL_READ_CHANNEL = None
 _ORIGINAL_DETECT_WELLS = None
 SCALING_SCHEMA_VERSION = 'nd2-omezarr-window-scaling-v2'
-DETECTOR_SCHEMA_VERSION = 'nd2-omezarr-local-contrast-hough-wall-qc-v2'
+DETECTOR_SCHEMA_VERSION = 'nd2-omezarr-local-contrast-hough-wall-coherence-v3'
+
+# For a centred regular hexagon, radial wall distance varies from apothem to
+# circumradius. Across angle, the IQR of radius / circumradius is ~0.064.
+# Allow ~2x that geometric variation for rounded/irregular real wells.
+WALL_RADIUS_IQR_FRACTION_MAX = 0.13
+WALL_COHERENCE_ANGLE_COUNT = 72
+WALL_COHERENCE_RADIAL_COUNT = 100
 
 
 def _unit_to_um(value: float, unit: str | None) -> float | None:
@@ -136,9 +145,6 @@ def install_omezarr_physical_metadata() -> None:
                     for i, row in enumerate(omero_channels)
                 ]
 
-            # Bump this fingerprint whenever converted-ND2 image handling or
-            # microwell detection changes so stale tile-scan checkpoints cannot
-            # silently survive a detector update.
             payload['nd2_omezarr_scaling_schema'] = SCALING_SCHEMA_VERSION
             payload['nd2_omezarr_detector_schema'] = DETECTOR_SCHEMA_VERSION
             payload_no_fp = dict(payload)
@@ -242,15 +248,71 @@ def _hough_candidates_converted_dic(rgb: np.ndarray, settings) -> np.ndarray:
     return np.asarray(kept, dtype=int)
 
 
-def detect_wells_converted_dic_with_qc(rgb: np.ndarray, settings) -> tuple[np.ndarray, list[dict]]:
-    """Generate Hough candidates then require a genuine DIC wall signature.
+def assess_wall_radial_coherence(
+    rgb: np.ndarray,
+    well_x: float,
+    well_y: float,
+    well_r: float,
+) -> dict:
+    """Test whether dark wall troughs occur at a coherent radius around the centre.
 
-    Hough operates on the locally contrast-normalised DIC tile. Candidate
-    validation is deliberately performed on the original window-scaled DIC tile,
-    using the existing KT3 circumferential wall-evidence QC. This prevents local
-    contrast enhancement from turning smooth background texture into accepted
-    microwells.
+    This complements the existing wall-darkness score. A genuine circular or
+    hexagonal microwell has a continuous wall whose radial position changes
+    smoothly with angle. Background texture may provide dark pixels on many
+    rays, but their radial positions are scattered across the search annulus.
     """
+    if well_r <= 0 or np.asarray(rgb).size == 0:
+        return {
+            'wall_radius_iqr_fraction': float('nan'),
+            'wall_radius_iqr_fraction_max': WALL_RADIUS_IQR_FRACTION_MAX,
+            'wall_radius_median_fraction': float('nan'),
+            'wall_radial_coherence_status': 'not_evaluable',
+        }
+
+    a = np.asarray(rgb)
+    if a.ndim == 3 and a.shape[2] >= 3:
+        dic = (a[..., 0].astype(np.float32) + a[..., 2].astype(np.float32)) / 2.0
+    else:
+        dic = a.astype(np.float32)
+    dic = gaussian_filter(dic, 1.0)
+
+    radii = np.linspace(
+        0.72 * float(well_r),
+        1.10 * float(well_r),
+        WALL_COHERENCE_RADIAL_COUNT,
+    )
+    trough_radii = []
+    for theta in np.linspace(0.0, 2.0 * math.pi, WALL_COHERENCE_ANGLE_COUNT, endpoint=False):
+        xs = float(well_x) + radii * math.cos(float(theta))
+        ys = float(well_y) + radii * math.sin(float(theta))
+        xi = np.clip(np.rint(xs).astype(int), 0, dic.shape[1] - 1)
+        yi = np.clip(np.rint(ys).astype(int), 0, dic.shape[0] - 1)
+        profile = dic[yi, xi]
+        trough_radii.append(float(radii[int(np.argmin(profile))]))
+
+    trough = np.asarray(trough_radii, dtype=float)
+    if trough.size < 24 or not np.all(np.isfinite(trough)):
+        return {
+            'wall_radius_iqr_fraction': float('nan'),
+            'wall_radius_iqr_fraction_max': WALL_RADIUS_IQR_FRACTION_MAX,
+            'wall_radius_median_fraction': float('nan'),
+            'wall_radial_coherence_status': 'not_evaluable',
+        }
+
+    q25, median_r, q75 = np.percentile(trough, [25.0, 50.0, 75.0])
+    iqr_fraction = float((q75 - q25) / float(well_r))
+    median_fraction = float(median_r / float(well_r))
+    status = 'accepted' if iqr_fraction <= WALL_RADIUS_IQR_FRACTION_MAX else 'rejected_incoherent_wall_radius'
+    return {
+        'wall_radius_iqr_fraction': iqr_fraction,
+        'wall_radius_iqr_fraction_max': WALL_RADIUS_IQR_FRACTION_MAX,
+        'wall_radius_median_fraction': median_fraction,
+        'wall_radial_coherence_status': status,
+    }
+
+
+def detect_wells_converted_dic_with_qc(rgb: np.ndarray, settings) -> tuple[np.ndarray, list[dict]]:
+    """Generate Hough candidates then require DIC darkness and radial coherence."""
     candidates = _hough_candidates_converted_dic(rgb, settings)
     if len(candidates) == 0:
         return np.empty((0, 3), dtype=int), []
@@ -279,28 +341,48 @@ def detect_wells_converted_dic_with_qc(rgb: np.ndarray, settings) -> tuple[np.nd
                 'well_wall_evidence_threshold': float(
                     getattr(settings, 'well_validity_score_threshold', WELL_VALIDITY_SCORE_THRESHOLD)
                 ),
+                'wall_radius_iqr_fraction': float('nan'),
+                'wall_radius_iqr_fraction_max': WALL_RADIUS_IQR_FRACTION_MAX,
+                'wall_radius_median_fraction': float('nan'),
+                'wall_radial_coherence_status': 'not_evaluable',
+                'accepted_by_converted_detector': False,
             })
             continue
 
-        qc = assess_microwell_boundary(
+        wall_qc = assess_microwell_boundary(
             rgb,
             well_x=float(x),
             well_y=float(y),
             well_r=float(calibrated_radius),
             settings=settings,
         )
-        score = qc.get('well_wall_evidence_score', float('nan'))
-        is_accepted = (
-            str(qc.get('well_validity_status', '')) == 'accepted'
-            and np.isfinite(float(score))
+        coherence = assess_wall_radial_coherence(
+            rgb,
+            well_x=float(x),
+            well_y=float(y),
+            well_r=float(calibrated_radius),
         )
-        rows.append({
+        score = wall_qc.get('well_wall_evidence_score', float('nan'))
+        is_accepted = (
+            str(wall_qc.get('well_validity_status', '')) == 'accepted'
+            and np.isfinite(float(score))
+            and coherence.get('wall_radial_coherence_status') == 'accepted'
+        )
+        reason = str(wall_qc.get('well_validity_reason', ''))
+        if str(wall_qc.get('well_validity_status', '')) == 'accepted' and not is_accepted:
+            reason = 'DIC wall is dark enough but its radial position is not coherent around the candidate centre'
+
+        row = {
             'x': int(x),
             'y': int(y),
             'detected_radius_px': int(detected_radius),
             'wall_reference_radius_px': float(calibrated_radius),
-            **qc,
-        })
+            **wall_qc,
+            **coherence,
+            'accepted_by_converted_detector': bool(is_accepted),
+            'converted_detector_reason': reason,
+        }
+        rows.append(row)
         if is_accepted:
             accepted.append((int(x), int(y), int(detected_radius)))
 
@@ -371,12 +453,13 @@ def process_converted_nd2_omezarr_qc(*args, **kwargs):
             )
             final_qc['channel_scaling_schema'] = SCALING_SCHEMA_VERSION
             final_qc['well_detector'] = (
-                'local-contrast physical-radius Hough candidates followed by original-DIC circumferential wall-evidence QC'
+                'local-contrast physical-radius Hough candidates followed by original-DIC wall-darkness and geometry-derived radial-coherence QC'
             )
             final_qc['well_detector_schema'] = DETECTOR_SCHEMA_VERSION
             final_qc['well_wall_evidence_threshold'] = float(
                 getattr(args[1] if len(args) > 1 else None, 'well_validity_score_threshold', WELL_VALIDITY_SCORE_THRESHOLD)
             )
+            final_qc['wall_radius_iqr_fraction_max'] = WALL_RADIUS_IQR_FRACTION_MAX
             config_path.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
         except Exception:
             pass
