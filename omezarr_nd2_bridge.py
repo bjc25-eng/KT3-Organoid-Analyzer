@@ -9,12 +9,13 @@ import numpy as np
 
 import large_data_core as ldc
 from nd2_qc import process_large_experiment_qc
+from well_qc import WELL_VALIDITY_SCORE_THRESHOLD, assess_microwell_boundary
 
 _ORIGINAL_METADATA = None
 _ORIGINAL_READ_CHANNEL = None
 _ORIGINAL_DETECT_WELLS = None
 SCALING_SCHEMA_VERSION = 'nd2-omezarr-window-scaling-v2'
-DETECTOR_SCHEMA_VERSION = 'nd2-omezarr-local-contrast-hough-v1'
+DETECTOR_SCHEMA_VERSION = 'nd2-omezarr-local-contrast-hough-wall-qc-v2'
 
 
 def _unit_to_um(value: float, unit: str | None) -> float | None:
@@ -135,9 +136,9 @@ def install_omezarr_physical_metadata() -> None:
                     for i, row in enumerate(omero_channels)
                 ]
 
-            # These schema tokens deliberately invalidate earlier tile-scan
-            # checkpoints whenever converted-ND2 intensity handling or the
-            # microwell detector changes.
+            # Bump this fingerprint whenever converted-ND2 image handling or
+            # microwell detection changes so stale tile-scan checkpoints cannot
+            # silently survive a detector update.
             payload['nd2_omezarr_scaling_schema'] = SCALING_SCHEMA_VERSION
             payload['nd2_omezarr_detector_schema'] = DETECTOR_SCHEMA_VERSION
             payload_no_fp = dict(payload)
@@ -200,12 +201,7 @@ def install_omezarr_window_scaled_reads() -> None:
 
 
 def local_contrast_dic(rgb: np.ndarray) -> np.ndarray:
-    """Locally stretch a DIC tile for edge detection only.
-
-    The original DIC pixels are left untouched for every downstream QC step.
-    Percentile stretching is calculated independently per scan tile so faint
-    microwell walls are not suppressed by the much wider global OME window.
-    """
+    """Locally stretch a DIC tile for Hough candidate generation only."""
     gray = cv2.cvtColor(np.asarray(rgb, dtype=np.uint8), cv2.COLOR_RGB2GRAY)
     finite = gray[np.isfinite(gray)]
     if finite.size == 0:
@@ -218,8 +214,7 @@ def local_contrast_dic(rgb: np.ndarray) -> np.ndarray:
     return np.clip(work, 0.0, 255.0).astype(np.uint8)
 
 
-def detect_wells_converted_dic(rgb: np.ndarray, settings) -> np.ndarray:
-    """Physical-radius Hough detection after local DIC contrast normalisation."""
+def _hough_candidates_converted_dic(rgb: np.ndarray, settings) -> np.ndarray:
     rmin = max(1, int(round(settings.well_rmin)))
     rmax = max(rmin + 1, int(round(settings.well_rmax)))
     spacing = max(1, int(round(settings.well_spacing)))
@@ -245,6 +240,77 @@ def detect_wells_converted_dic(rgb: np.ndarray, settings) -> np.ndarray:
         if all((x - a) ** 2 + (y - b) ** 2 > 20 ** 2 for a, b, _ in kept):
             kept.append((int(x), int(y), int(radius)))
     return np.asarray(kept, dtype=int)
+
+
+def detect_wells_converted_dic_with_qc(rgb: np.ndarray, settings) -> tuple[np.ndarray, list[dict]]:
+    """Generate Hough candidates then require a genuine DIC wall signature.
+
+    Hough operates on the locally contrast-normalised DIC tile. Candidate
+    validation is deliberately performed on the original window-scaled DIC tile,
+    using the existing KT3 circumferential wall-evidence QC. This prevents local
+    contrast enhancement from turning smooth background texture into accepted
+    microwells.
+    """
+    candidates = _hough_candidates_converted_dic(rgb, settings)
+    if len(candidates) == 0:
+        return np.empty((0, 3), dtype=int), []
+
+    calibrated_radius = 0.5 * (float(settings.well_rmin) + float(settings.well_rmax))
+    required_margin = 1.35 * calibrated_radius
+    height, width = np.asarray(rgb).shape[:2]
+    accepted = []
+    rows: list[dict] = []
+
+    for x, y, detected_radius in candidates:
+        if (
+            float(x) < required_margin
+            or float(y) < required_margin
+            or float(x) >= float(width) - required_margin
+            or float(y) >= float(height) - required_margin
+        ):
+            rows.append({
+                'x': int(x),
+                'y': int(y),
+                'detected_radius_px': int(detected_radius),
+                'wall_reference_radius_px': float(calibrated_radius),
+                'well_validity_status': 'rejected_tile_edge',
+                'well_validity_reason': 'candidate wall cannot be fully evaluated inside this scan tile',
+                'well_wall_evidence_score': float('nan'),
+                'well_wall_evidence_threshold': float(
+                    getattr(settings, 'well_validity_score_threshold', WELL_VALIDITY_SCORE_THRESHOLD)
+                ),
+            })
+            continue
+
+        qc = assess_microwell_boundary(
+            rgb,
+            well_x=float(x),
+            well_y=float(y),
+            well_r=float(calibrated_radius),
+            settings=settings,
+        )
+        score = qc.get('well_wall_evidence_score', float('nan'))
+        is_accepted = (
+            str(qc.get('well_validity_status', '')) == 'accepted'
+            and np.isfinite(float(score))
+        )
+        rows.append({
+            'x': int(x),
+            'y': int(y),
+            'detected_radius_px': int(detected_radius),
+            'wall_reference_radius_px': float(calibrated_radius),
+            **qc,
+        })
+        if is_accepted:
+            accepted.append((int(x), int(y), int(detected_radius)))
+
+    return np.asarray(accepted, dtype=int).reshape((-1, 3)), rows
+
+
+def detect_wells_converted_dic(rgb: np.ndarray, settings) -> np.ndarray:
+    """Converted-ND2 microwell detector used by the whole-array scan."""
+    accepted, _ = detect_wells_converted_dic_with_qc(rgb, settings)
+    return accepted
 
 
 def install_converted_nd2_bridge() -> None:
@@ -278,7 +344,7 @@ def calibrated_scan_settings(settings, converted_meta: dict):
 
 
 def process_converted_nd2_omezarr_qc(*args, **kwargs):
-    """Run final QC on an ND2-derived OME-Zarr with a route-local DIC detector."""
+    """Run final QC on an ND2-derived OME-Zarr with route-local well detection."""
     global _ORIGINAL_DETECT_WELLS
     install_converted_nd2_bridge()
 
@@ -305,9 +371,12 @@ def process_converted_nd2_omezarr_qc(*args, **kwargs):
             )
             final_qc['channel_scaling_schema'] = SCALING_SCHEMA_VERSION
             final_qc['well_detector'] = (
-                'physical-radius Hough detection after per-tile 1st–99th percentile DIC contrast normalisation'
+                'local-contrast physical-radius Hough candidates followed by original-DIC circumferential wall-evidence QC'
             )
             final_qc['well_detector_schema'] = DETECTOR_SCHEMA_VERSION
+            final_qc['well_wall_evidence_threshold'] = float(
+                getattr(args[1] if len(args) > 1 else None, 'well_validity_score_threshold', WELL_VALIDITY_SCORE_THRESHOLD)
+            )
             config_path.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
         except Exception:
             pass
