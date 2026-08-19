@@ -104,7 +104,7 @@ a, b, c = st.columns(3)
 with a:
     well_diameter = st.number_input('Microwell diameter (µm)', min_value=1.0, value=100.0, step=1.0)
 with b:
-    tile_size = st.selectbox('Well-scan tile size (px)', [1024, 1536, 2048, 3072], index=0)
+    tile_size = st.selectbox('Well-scan tile size (px)', [1024, 1536, 2048, 3072], index=2)
 with c:
     standard_crop = st.selectbox('ML crop size (px)', [128, 224, 256, 320, 512], index=2)
 
@@ -154,14 +154,14 @@ channel_config = {
 
 st.subheader('4. DIC diagnostic preview')
 st.caption(
-    'Sample nine real 1024×1024 DIC regions. The preview now uses the exact same '
-    'local-contrast physical-radius detector as the converted whole-array run. '
-    'Red circles are detected microwells.'
+    'Sample nine real 2048×2048 DIC regions. This matches the validated large-image '
+    'tile size more closely than the earlier 1024-pixel preview. Red circles are '
+    'microwells returned by the same converted-ND2 detector used for the whole-array run.'
 )
 
 if st.button('Generate DIC diagnostic preview', use_container_width=True):
     install_converted_nd2_bridge()
-    preview_size = 1024
+    preview_size = 2048
     x_positions = sorted(set([
         0,
         max(0, (int(meta['width_px']) - preview_size) // 2),
@@ -176,7 +176,7 @@ if st.button('Generate DIC diagnostic preview', use_container_width=True):
     diagnostic_rows = []
     try:
         with ldc.LargeImageReader(str(zarr_path), source_type='OME-Zarr', series_index=0, level=0) as reader:
-            for row_i, y0 in enumerate(y_positions):
+            for y0 in y_positions:
                 cols = st.columns(len(x_positions))
                 for col_i, x0 in enumerate(x_positions):
                     dic = reader.read_channel_region(
@@ -188,14 +188,8 @@ if st.button('Generate DIC diagnostic preview', use_container_width=True):
                     enhanced = local_contrast_dic(dic_rgb)
                     overlay = np.stack([enhanced, enhanced, enhanced], axis=-1)
                     for cx, cy, radius in circles:
-                        cv2.circle(
-                            overlay,
-                            (int(cx), int(cy)),
-                            int(radius),
-                            (255, 0, 0),
-                            2,
-                        )
-                        cv2.circle(overlay, (int(cx), int(cy)), 2, (255, 0, 0), -1)
+                        cv2.circle(overlay, (int(cx), int(cy)), int(radius), (255, 0, 0), 3)
+                        cv2.circle(overlay, (int(cx), int(cy)), 3, (255, 0, 0), -1)
 
                     p1, p50, p99 = np.percentile(dic, [1, 50, 99])
                     diagnostic_rows.append({
