@@ -9,13 +9,14 @@ import cv2
 import numpy as np
 
 import large_data_core as ldc
+from nd2_global_grid_qc import apply_global_grid_qc_to_result
 from nd2_qc import process_large_experiment_qc
 
 _ORIGINAL_METADATA = None
 _ORIGINAL_READ_CHANNEL = None
 _ORIGINAL_DETECT_WELLS = None
 SCALING_SCHEMA_VERSION = 'nd2-omezarr-window-scaling-v2'
-DETECTOR_SCHEMA_VERSION = 'nd2-omezarr-array-edge-mask-hough-v7'
+DETECTOR_SCHEMA_VERSION = 'nd2-omezarr-array-edge-mask-hough-grid-v8'
 
 # These values control only where the already-working per-tile Hough detector is
 # allowed to operate. They do not change the Hough well detector itself.
@@ -370,7 +371,7 @@ def calibrated_scan_settings(settings, converted_meta: dict):
 
 
 def process_converted_nd2_omezarr_qc(*args, **kwargs):
-    """Run the validated final-QC engine using the converted-ND2 well detector."""
+    """Run final QC, then apply conservative whole-array grid consistency cleanup."""
     global _ORIGINAL_DETECT_WELLS
     install_converted_nd2_bridge()
 
@@ -381,6 +382,10 @@ def process_converted_nd2_omezarr_qc(*args, **kwargs):
         result = process_large_experiment_qc(*args, **kwargs)
     finally:
         ldc.detect_wells = old_detector
+
+    settings = args[1] if len(args) > 1 else kwargs.get('settings')
+    if settings is not None:
+        result = apply_global_grid_qc_to_result(result, settings)
 
     root = Path(result[0])
     config_path = root / 'run_configuration.json'
@@ -397,7 +402,7 @@ def process_converted_nd2_omezarr_qc(*args, **kwargs):
             )
             final_qc['channel_scaling_schema'] = SCALING_SCHEMA_VERSION
             final_qc['well_detector'] = (
-                'local-contrast physical-radius Hough detection; non-array tiles skipped; only mixed edge tiles are contour-footprint masked'
+                '2048-pixel local-contrast physical-radius Hough detection; non-array tiles skipped; mixed edge tiles footprint-masked; final whole-array grid-consistency cleanup applied conservatively'
             )
             final_qc['well_detector_schema'] = DETECTOR_SCHEMA_VERSION
             final_qc['array_tile_min_closed_contours'] = ARRAY_MIN_WELL_LIKE_CONTOURS
