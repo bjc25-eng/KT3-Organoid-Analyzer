@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-from analysis_core import GFP_MODE, build_settings_from_widgets, zip_bytes
+import large_data_core as ldc
+from analysis_core import GFP_MODE, build_settings_from_widgets, detect_wells, zip_bytes
 from nd2_omezarr import probe_omezarr
 from omezarr_nd2_bridge import (
     calibrated_scan_settings,
     infer_channel_indices,
+    install_converted_nd2_bridge,
     process_converted_nd2_omezarr_qc,
 )
 
@@ -146,8 +150,84 @@ channel_config = {
     'internal_t_index': 0,
 }
 
+st.subheader('4. DIC diagnostic preview')
+st.caption(
+    'Before another full-array run, sample nine real 1024×1024 DIC regions across the stitched image. '
+    'Red circles are the microwells detected with the current physical radius and Hough sensitivity.'
+)
+
+if st.button('Generate DIC diagnostic preview', use_container_width=True):
+    install_converted_nd2_bridge()
+    preview_size = 1024
+    x_positions = sorted(set([
+        0,
+        max(0, (int(meta['width_px']) - preview_size) // 2),
+        max(0, int(meta['width_px']) - preview_size),
+    ]))
+    y_positions = sorted(set([
+        0,
+        max(0, (int(meta['height_px']) - preview_size) // 2),
+        max(0, int(meta['height_px']) - preview_size),
+    ]))
+
+    diagnostic_rows = []
+    try:
+        with ldc.LargeImageReader(str(zarr_path), source_type='OME-Zarr', series_index=0, level=0) as reader:
+            for row_i, y0 in enumerate(y_positions):
+                cols = st.columns(len(x_positions))
+                for col_i, x0 in enumerate(x_positions):
+                    dic = reader.read_channel_region(
+                        int(x0), int(y0), preview_size, preview_size,
+                        int(dic_channel), 0, 0,
+                    )
+                    dic_rgb = np.stack([dic, dic, dic], axis=-1)
+                    circles = detect_wells(dic_rgb, settings)
+                    overlay = dic_rgb.copy()
+                    for cx, cy, radius in circles:
+                        cv2.circle(
+                            overlay,
+                            (int(cx), int(cy)),
+                            int(radius),
+                            (255, 0, 0),
+                            2,
+                        )
+                        cv2.circle(overlay, (int(cx), int(cy)), 2, (255, 0, 0), -1)
+
+                    p1, p50, p99 = np.percentile(dic, [1, 50, 99])
+                    diagnostic_rows.append({
+                        'x0': int(x0),
+                        'y0': int(y0),
+                        'detected_wells': int(len(circles)),
+                        'DIC_min': int(np.min(dic)),
+                        'DIC_p1': float(p1),
+                        'DIC_median': float(p50),
+                        'DIC_p99': float(p99),
+                        'DIC_max': int(np.max(dic)),
+                    })
+                    with cols[col_i]:
+                        st.image(
+                            overlay,
+                            caption=(
+                                f'x={int(x0):,}, y={int(y0):,} · '
+                                f'{len(circles)} wells · DIC p1/p99={p1:.0f}/{p99:.0f}'
+                            ),
+                            use_container_width=True,
+                        )
+        diagnostics = pd.DataFrame(diagnostic_rows)
+        st.dataframe(diagnostics, hide_index=True, use_container_width=True)
+        total_preview_wells = int(diagnostics['detected_wells'].sum()) if not diagnostics.empty else 0
+        if total_preview_wells:
+            st.success(f'Diagnostic preview detected {total_preview_wells} candidate microwells across the nine sampled regions.')
+        else:
+            st.warning(
+                'The current detector found zero wells in all diagnostic regions. '
+                'Do not run the full array again yet; inspect these DIC tiles first.'
+            )
+    except Exception as exc:
+        st.error(f'DIC diagnostic failed: {type(exc).__name__}: {exc!s}')
+
 work_root = zarr_path.parent.parent / 'omezarr_analysis_work'
-st.subheader('4. Run / resume')
+st.subheader('5. Run / resume')
 st.caption(f'Persistent checkpoint root: {work_root}')
 
 source = {
@@ -197,15 +277,32 @@ if run:
             progress_callback=progress,
             make_ml_export=True,
         )
-        progress_bar.progress(100, text='Whole-array analysis complete.')
+        progress_bar.progress(100, text='Whole-array analysis finished.')
         status.empty()
-        st.success(
-            f"Complete: {len(wdf):,} wells, {len(pdf):,} PDO observations, "
-            f"{len(pscdf):,} PSC/RFP foci."
-        )
+
+        error_rows = pd.DataFrame()
+        if isinstance(manifest, pd.DataFrame) and not manifest.empty and 'analysis_status' in manifest.columns:
+            error_rows = manifest[manifest['analysis_status'].astype(str).str.lower().eq('error')]
+
+        if not error_rows.empty:
+            first_error = str(error_rows.iloc[0].get('error', '') or 'Unknown source error')
+            st.error(f'Whole-array source failed: {first_error}')
+            st.dataframe(error_rows, hide_index=True, use_container_width=True)
+        elif len(wdf) == 0:
+            st.warning(
+                'The run completed without a source exception, but zero microwells were detected. '
+                'Use the DIC diagnostic preview above before changing detection thresholds.'
+            )
+        else:
+            st.success(
+                f"Complete: {len(wdf):,} wells, {len(pdf):,} PDO observations, "
+                f"{len(pscdf):,} PSC/RFP foci."
+            )
+
         st.session_state['converted_nd2_results_zip'] = zip_bytes(out)
         st.session_state['converted_nd2_ml_zip'] = zip_bytes(ml_path) if ml_path is not None else None
-        st.dataframe(wdf.head(50), use_container_width=True, hide_index=True)
+        if not wdf.empty:
+            st.dataframe(wdf.head(50), use_container_width=True, hide_index=True)
         if not pdf.empty:
             st.markdown('**PDO observations preview**')
             st.dataframe(pdf.head(50), use_container_width=True, hide_index=True)
