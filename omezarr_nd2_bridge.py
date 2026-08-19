@@ -4,6 +4,7 @@ import copy
 import json
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 import large_data_core as ldc
@@ -11,7 +12,9 @@ from nd2_qc import process_large_experiment_qc
 
 _ORIGINAL_METADATA = None
 _ORIGINAL_READ_CHANNEL = None
+_ORIGINAL_DETECT_WELLS = None
 SCALING_SCHEMA_VERSION = 'nd2-omezarr-window-scaling-v2'
+DETECTOR_SCHEMA_VERSION = 'nd2-omezarr-local-contrast-hough-v1'
 
 
 def _unit_to_um(value: float, unit: str | None) -> float | None:
@@ -132,16 +135,15 @@ def install_omezarr_physical_metadata() -> None:
                     for i, row in enumerate(omero_channels)
                 ]
 
-            # This schema token deliberately changes the source fingerprint after
-            # changing channel scaling, so an old zero-well tile checkpoint cannot
-            # be silently reused.
+            # These schema tokens deliberately invalidate earlier tile-scan
+            # checkpoints whenever converted-ND2 intensity handling or the
+            # microwell detector changes.
             payload['nd2_omezarr_scaling_schema'] = SCALING_SCHEMA_VERSION
+            payload['nd2_omezarr_detector_schema'] = DETECTOR_SCHEMA_VERSION
             payload_no_fp = dict(payload)
             payload_no_fp.pop('reference_fingerprint_sha256', None)
             payload['reference_fingerprint_sha256'] = ldc._json_fingerprint(payload_no_fp)
         except Exception:
-            # The downstream physical-calibration check fails explicitly if the
-            # required metadata is absent; never invent a pixel size here.
             pass
         return payload
 
@@ -150,13 +152,7 @@ def install_omezarr_physical_metadata() -> None:
 
 
 def install_omezarr_window_scaled_reads() -> None:
-    """Scale ND2-derived OME-Zarr planes with each OME display window.
-
-    The converted source is uint16. Generic integer scaling against 65535 makes
-    the low-dynamic-range DIC channel almost black (its preserved OME window is
-    only hundreds of intensity units). This wrapper reads the raw Zarr region and
-    maps the channel-specific OME display window to uint8 for image processing.
-    """
+    """Scale ND2-derived OME-Zarr planes with each OME display window."""
     global _ORIGINAL_READ_CHANNEL
     if getattr(ldc.LargeImageReader.read_channel_region, '_omezarr_window_scaled_wrapper', False):
         return
@@ -203,6 +199,54 @@ def install_omezarr_window_scaled_reads() -> None:
     ldc.LargeImageReader.read_channel_region = wrapped
 
 
+def local_contrast_dic(rgb: np.ndarray) -> np.ndarray:
+    """Locally stretch a DIC tile for edge detection only.
+
+    The original DIC pixels are left untouched for every downstream QC step.
+    Percentile stretching is calculated independently per scan tile so faint
+    microwell walls are not suppressed by the much wider global OME window.
+    """
+    gray = cv2.cvtColor(np.asarray(rgb, dtype=np.uint8), cv2.COLOR_RGB2GRAY)
+    finite = gray[np.isfinite(gray)]
+    if finite.size == 0:
+        return np.zeros_like(gray, dtype=np.uint8)
+    low, high = np.percentile(finite, [1.0, 99.0])
+    if not np.isfinite(low) or not np.isfinite(high) or float(high) <= float(low) + 1.0:
+        return gray
+    work = gray.astype(np.float32)
+    work = (work - float(low)) * (255.0 / float(high - low))
+    return np.clip(work, 0.0, 255.0).astype(np.uint8)
+
+
+def detect_wells_converted_dic(rgb: np.ndarray, settings) -> np.ndarray:
+    """Physical-radius Hough detection after local DIC contrast normalisation."""
+    rmin = max(1, int(round(settings.well_rmin)))
+    rmax = max(rmin + 1, int(round(settings.well_rmax)))
+    spacing = max(1, int(round(settings.well_spacing)))
+
+    gray = local_contrast_dic(rgb)
+    blur = cv2.GaussianBlur(gray, (7, 7), 1.5)
+    circles = cv2.HoughCircles(
+        blur,
+        cv2.HOUGH_GRADIENT,
+        dp=1.15,
+        minDist=float(spacing),
+        param1=75.0,
+        param2=float(settings.hough_p2),
+        minRadius=int(rmin),
+        maxRadius=int(rmax),
+    )
+    if circles is None:
+        return np.empty((0, 3), dtype=int)
+
+    circles = np.round(circles[0]).astype(int)
+    kept = []
+    for x, y, radius in circles[np.argsort(circles[:, 0])]:
+        if all((x - a) ** 2 + (y - b) ** 2 > 20 ** 2 for a, b, _ in kept):
+            kept.append((int(x), int(y), int(radius)))
+    return np.asarray(kept, dtype=int)
+
+
 def install_converted_nd2_bridge() -> None:
     install_omezarr_physical_metadata()
     install_omezarr_window_scaled_reads()
@@ -234,9 +278,18 @@ def calibrated_scan_settings(settings, converted_meta: dict):
 
 
 def process_converted_nd2_omezarr_qc(*args, **kwargs):
-    """Run the validated final-QC engine on an ND2-derived OME-Zarr source."""
+    """Run final QC on an ND2-derived OME-Zarr with a route-local DIC detector."""
+    global _ORIGINAL_DETECT_WELLS
     install_converted_nd2_bridge()
-    result = process_large_experiment_qc(*args, **kwargs)
+
+    old_detector = ldc.detect_wells
+    _ORIGINAL_DETECT_WELLS = old_detector
+    ldc.detect_wells = detect_wells_converted_dic
+    try:
+        result = process_large_experiment_qc(*args, **kwargs)
+    finally:
+        ldc.detect_wells = old_detector
+
     root = Path(result[0])
     config_path = root / 'run_configuration.json'
     if config_path.exists():
@@ -251,6 +304,10 @@ def process_converted_nd2_omezarr_qc(*args, **kwargs):
                 'per-channel OME display windows mapped to uint8 before image processing'
             )
             final_qc['channel_scaling_schema'] = SCALING_SCHEMA_VERSION
+            final_qc['well_detector'] = (
+                'physical-radius Hough detection after per-tile 1st–99th percentile DIC contrast normalisation'
+            )
+            final_qc['well_detector_schema'] = DETECTOR_SCHEMA_VERSION
             config_path.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
         except Exception:
             pass
