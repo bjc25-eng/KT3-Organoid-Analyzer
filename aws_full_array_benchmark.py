@@ -14,6 +14,7 @@ from scipy.ndimage import gaussian_filter
 
 from analysis_core import Settings, segment_pdos
 from nd2_omezarr import probe_omezarr
+from omezarr_cyx import SingletonTZCYX
 
 
 def _window_end(root, channel: int, dtype) -> float:
@@ -139,9 +140,8 @@ def main() -> int:
     src=args.source.expanduser().resolve(); out=args.output_dir.expanduser().resolve(); out.mkdir(parents=True,exist_ok=True)
     meta=probe_omezarr(src)
     root=zarr.open_group(str(src),mode='r'); arr=root[meta['level0_array_path']]
-    if meta['axes'] != ['C','Y','X'] or arr.ndim != 3:
-        raise RuntimeError(f"Expected C,Y,X OME-Zarr; got axes={meta['axes']} shape={arr.shape}")
-    c,h,w=map(int,arr.shape); labels=_channel_labels(root,c)
+    planes=SingletonTZCYX(arr,meta['axes'])
+    c,h,w=planes.shape_cyx; labels=_channel_labels(root,c)
     voxel=meta.get('voxel_size_um') or {}
     px_x=float(voxel.get('x',0) or 0); px_y=float(voxel.get('y',0) or 0)
     if px_x <= 0 or px_y <= 0:
@@ -159,7 +159,7 @@ def main() -> int:
     for ti,(cx0,cy0,cw,ch) in enumerate(tile_list,1):
         rx0=max(0,cx0-overlap); ry0=max(0,cy0-overlap)
         rx1=min(w,cx0+cw+overlap); ry1=min(h,cy0+ch+overlap)
-        dic_raw=np.asarray(arr[int(args.dic_channel),ry0:ry1,rx0:rx1])
+        dic_raw=planes.read(int(args.dic_channel),slice(ry0,ry1),slice(rx0,rx1))
         dic=_u8_local(dic_raw)
         local=_detect_wells_tile(dic,expected_radius,args.hough_p2)
         for lx,ly,r in local:
@@ -204,7 +204,7 @@ def main() -> int:
             continue
         rx0=max(0,cx0-overlap); ry0=max(0,cy0-overlap)
         rx1=min(w,cx0+cw+overlap); ry1=min(h,cy0+ch+overlap)
-        graw=np.asarray(arr[int(args.gfp_channel),ry0:ry1,rx0:rx1])
+        graw=planes.read(int(args.gfp_channel),slice(ry0,ry1),slice(rx0,rx1))
         gfp=_u8_absolute(graw,gfp_max)
         for wi,wx,wy,wr in wells_here:
             lx,ly=int(wx-rx0),int(wy-ry0)

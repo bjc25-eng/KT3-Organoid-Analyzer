@@ -14,6 +14,7 @@ from scipy.spatial import cKDTree
 
 from analysis_core import Settings, segment_pdos
 from nd2_omezarr import probe_omezarr
+from omezarr_cyx import SingletonTZCYX
 
 
 def _window_end(root, channel: int, dtype) -> float:
@@ -122,9 +123,8 @@ def main() -> int:
     started=time.time(); src=args.source.expanduser().resolve(); raw_csv=args.raw_wells_csv.expanduser().resolve(); out=args.output_dir.expanduser().resolve(); out.mkdir(parents=True,exist_ok=True)
     meta=probe_omezarr(src)
     root=zarr.open_group(str(src),mode='r'); arr=root[meta['level0_array_path']]
-    if meta['axes'] != ['C','Y','X'] or arr.ndim != 3:
-        raise RuntimeError(f"Expected C,Y,X OME-Zarr; got axes={meta['axes']} shape={arr.shape}")
-    c,h,w=map(int,arr.shape)
+    planes=SingletonTZCYX(arr,meta['axes'])
+    c,h,w=planes.shape_cyx
     voxel=meta.get('voxel_size_um') or {}
     px_x=float(voxel.get('x',0) or 0); px_y=float(voxel.get('y',0) or 0)
     if px_x <= 0 or px_y <= 0:
@@ -162,7 +162,7 @@ def main() -> int:
         if not wells_here:
             continue
         rx0=max(0,cx0-overlap); ry0=max(0,cy0-overlap); rx1=min(w,cx0+cw+overlap); ry1=min(h,cy0+ch+overlap)
-        graw=np.asarray(arr[int(args.gfp_channel),ry0:ry1,rx0:rx1]); gfp=_u8_absolute(graw,gfp_max)
+        graw=planes.read(int(args.gfp_channel),slice(ry0,ry1),slice(rx0,rx1)); gfp=_u8_absolute(graw,gfp_max)
         for wi,wx,wy,wr in wells_here:
             lx,ly=int(wx-rx0),int(wy-ry0); cr=int(math.ceil(wr*0.95)); xa=max(0,lx-cr); xb=min(gfp.shape[1],lx+cr+1); ya=max(0,ly-cr); yb=min(gfp.shape[0],ly+cr+1)
             sub=gfp[ya:yb,xa:xb].astype(np.float32); yy,xx=np.ogrid[:sub.shape[0],:sub.shape[1]]; scx=lx-xa; scy=ly-ya

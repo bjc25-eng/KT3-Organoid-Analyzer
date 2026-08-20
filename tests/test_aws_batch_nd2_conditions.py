@@ -11,7 +11,10 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+
 import aws_batch_nd2_conditions as batch
+from omezarr_cyx import SingletonTZCYX
 
 
 def _objects():
@@ -194,6 +197,36 @@ class BatchND2Tests(unittest.TestCase):
         self.assertEqual(commands['benchmark'][commands['benchmark'].index('--dic-channel')+1],'0')
         self.assertEqual(Path(commands['refine'][1]).name,'aws_refine_lattice.py')
         self.assertEqual(Path(commands['hex_qc'][1]).name,'aws_extract_hex_array_component.py')
+
+    def test_singleton_time_axis_is_indexed_before_tile_read(self):
+        class FakeArray:
+            shape=(1,3,81698,8219)
+            def __init__(self): self.selector=None
+            def __getitem__(self,selector):
+                self.selector=selector
+                return np.zeros((20,30),dtype=np.uint16)
+        array=FakeArray(); planes=SingletonTZCYX(array,['T','C','Y','X'])
+        tile=planes.read(2,slice(100,120),slice(200,230))
+        self.assertEqual(planes.shape_cyx,(3,81698,8219))
+        self.assertEqual(array.selector,(0,2,slice(100,120),slice(200,230)))
+        self.assertEqual(tile.shape,(20,30))
+
+    def test_singleton_time_and_z_axes_are_supported(self):
+        class FakeArray:
+            shape=(1,3,1,100,80)
+            def __init__(self): self.selector=None
+            def __getitem__(self,selector):
+                self.selector=selector
+                return np.zeros((5,7),dtype=np.uint16)
+        array=FakeArray(); planes=SingletonTZCYX(array,['T','C','Z','Y','X'])
+        planes.read(1,slice(10,15),slice(20,27))
+        self.assertEqual(array.selector,(0,1,0,slice(10,15),slice(20,27)))
+
+    def test_non_singleton_time_or_z_axis_is_rejected(self):
+        class FakeArray:
+            shape=(2,3,10,10)
+        with self.assertRaisesRegex(RuntimeError,'T axis has size 2'):
+            SingletonTZCYX(FakeArray(),['T','C','Y','X'])
 
 
 if __name__ == '__main__':
