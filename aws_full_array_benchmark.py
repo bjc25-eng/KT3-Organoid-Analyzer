@@ -13,15 +13,7 @@ import zarr
 from scipy.ndimage import gaussian_filter
 
 from analysis_core import Settings, segment_pdos
-
-
-def _read_scale(root) -> tuple[float, float]:
-    try:
-        ms = root.attrs['multiscales'][0]
-        scale = ms['datasets'][0]['coordinateTransformations'][0]['scale']
-        return float(scale[-1]), float(scale[-2])
-    except Exception:
-        return 1.0, 1.0
+from nd2_omezarr import probe_omezarr
 
 
 def _window_end(root, channel: int, dtype) -> float:
@@ -145,11 +137,18 @@ def main() -> int:
 
     started=time.time()
     src=args.source.expanduser().resolve(); out=args.output_dir.expanduser().resolve(); out.mkdir(parents=True,exist_ok=True)
-    root=zarr.open_group(str(src),mode='r'); arr=root['0']
-    if arr.ndim != 3:
-        raise RuntimeError(f'Expected C,Y,X OME-Zarr; got {arr.shape}')
+    meta=probe_omezarr(src)
+    root=zarr.open_group(str(src),mode='r'); arr=root[meta['level0_array_path']]
+    if meta['axes'] != ['C','Y','X'] or arr.ndim != 3:
+        raise RuntimeError(f"Expected C,Y,X OME-Zarr; got axes={meta['axes']} shape={arr.shape}")
     c,h,w=map(int,arr.shape); labels=_channel_labels(root,c)
-    px_x,px_y=_read_scale(root); px_um=(px_x+px_y)/2.0
+    voxel=meta.get('voxel_size_um') or {}
+    px_x=float(voxel.get('x',0) or 0); px_y=float(voxel.get('y',0) or 0)
+    if px_x <= 0 or px_y <= 0:
+        raise RuntimeError('OME-Zarr metadata does not contain valid physical X/Y pixel calibration.')
+    if not (0 <= int(args.gfp_channel) < c and 0 <= int(args.dic_channel) < c):
+        raise RuntimeError(f'Channel mapping GFP={args.gfp_channel}, DIC={args.dic_channel} is invalid for {c} channels.')
+    px_um=(px_x+px_y)/2.0
     expected_radius=float(args.well_diameter_um)/(2.0*px_um)
     tile=max(1024,int(args.tile)); overlap=int(math.ceil(expected_radius*3.0))
     tile_list=list(_tiles(w,h,tile))
@@ -250,6 +249,7 @@ def main() -> int:
     summary={
         'source':str(src),'shape_cyx':[c,h,w],'channel_labels':labels,'dtype':str(arr.dtype),
         'pixel_size_um':{'x':px_x,'y':px_y},'well_diameter_um':float(args.well_diameter_um),
+        'gfp_channel':int(args.gfp_channel),'dic_channel':int(args.dic_channel),'hough_p2':float(args.hough_p2),
         'expected_well_radius_px':expected_radius,'tile_size_px':tile,'tile_count':len(tile_list),
         'raw_well_candidates':len(raw_wells),'grid_filtered_wells':len(filtered),**grid_info,
         'pdo_segmentation_mode':'conservative_contiguous_components_no_watershed_split',
