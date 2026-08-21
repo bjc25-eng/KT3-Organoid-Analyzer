@@ -36,8 +36,9 @@ class FinalPdoRfpCropExporterTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def _make_zarr(self, condition_id: str, *, labels=None, windows=True) -> Path:
-        path = self.cache / f'{condition_id}.ome.zarr'
+    def _make_zarr(self, condition_id: str, *, labels=None, windows=True,
+                   store_name: str | None = None) -> Path:
+        path = self.cache / (store_name or f'{condition_id}.ome.zarr')
         root = zarr.open_group(str(path), mode='w')
         data = np.zeros((1, 3, 80, 84), dtype=np.uint16)
         yy, xx = np.indices(data.shape[-2:])
@@ -108,10 +109,18 @@ class FinalPdoRfpCropExporterTests(unittest.TestCase):
 
     def _make_condition(self, condition_id: str, *, positive_count=1, total_wells=2,
                         insufficient_ids=(), omit_rfp_ids=(), duplicate_rfp_id=None,
-                        bad_pdo_count=False, windows=True, labels=None) -> Path:
-        self._make_zarr(condition_id, windows=windows, labels=labels)
+                        bad_pdo_count=False, windows=True, labels=None,
+                        create_default_zarr=True, condition_name: str | None = None) -> Path:
+        if create_default_zarr:
+            self._make_zarr(condition_id, windows=windows, labels=labels)
         folder = self.results / condition_id
         folder.mkdir(parents=True, exist_ok=True)
+        (folder / 'condition_summary.json').write_text(json.dumps({
+            'completion_status': 'completed', 'condition_id': condition_id,
+            'condition_name': condition_name or f'{condition_id}_original',
+            'pixel_size_um': {'x': PIXEL_SIZE, 'y': PIXEL_SIZE},
+            'channel_mapping': {'gfp_channel': 0, 'dic_channel': 2},
+        }), encoding='utf-8')
         wells = []
         pdos = []
         rfp_rows = []
@@ -343,6 +352,88 @@ class FinalPdoRfpCropExporterTests(unittest.TestCase):
     def test_channel_mapping_is_validated_without_guessing(self):
         condition = next(iter(exporter.CONDITIONS))
         folder = self._make_condition(condition, labels=['RFP', 'GFP', 'DIC'])
+        self.assertEqual(exporter.run(self._args('--condition-id', condition)), 1)
+        summary = json.loads((folder / exporter.OUTPUT_DIRECTORY /
+                              'crop_export_summary.json').read_text(encoding='utf-8'))
+        self.assertIn('Cannot validate GFP=0', summary['error'])
+
+    def test_existing_batch_status_omezarr_path_has_priority(self):
+        condition = next(iter(exporter.CONDITIONS))
+        recorded = self._make_zarr(
+            condition, store_name='production_original_batch_status_name.ome.zarr'
+        )
+        folder = self._make_condition(condition)
+        (self.results / 'batch_status.json').write_text(json.dumps({
+            'conditions': {condition: {'omezarr': str(recorded)}}
+        }), encoding='utf-8')
+        self.assertEqual(exporter.run(self._args('--condition-id', condition)), 0)
+        summary = json.loads((folder / exporter.OUTPUT_DIRECTORY /
+                              'crop_export_summary.json').read_text(encoding='utf-8'))
+        self.assertEqual(Path(summary['omezarr_source']), recorded.resolve())
+
+    def test_existing_condition_summary_omezarr_path_is_used(self):
+        condition = next(iter(exporter.CONDITIONS))
+        recorded = self._make_zarr(
+            condition, store_name='production_original_condition_summary_name.ome.zarr'
+        )
+        folder = self._make_condition(condition)
+        summary_path = folder / 'condition_summary.json'
+        condition_summary = json.loads(summary_path.read_text(encoding='utf-8'))
+        condition_summary['omezarr'] = str(recorded)
+        summary_path.write_text(json.dumps(condition_summary), encoding='utf-8')
+        self.assertEqual(exporter.run(self._args('--condition-id', condition)), 0)
+        summary = json.loads((folder / exporter.OUTPUT_DIRECTORY /
+                              'crop_export_summary.json').read_text(encoding='utf-8'))
+        self.assertEqual(Path(summary['omezarr_source']), recorded.resolve())
+
+    def test_unique_source_named_cache_fallback_succeeds(self):
+        condition = next(iter(exporter.CONDITIONS))
+        source_name = 'Original Nikon acquisition retained source name'
+        folder = self._make_condition(
+            condition, create_default_zarr=False, condition_name=source_name
+        )
+        source_store = self._make_zarr(
+            condition, store_name=f'{source_name}.ome.zarr'
+        )
+        self.assertNotEqual(source_store.name, f'{condition}.ome.zarr')
+        self.assertEqual(exporter.run(self._args('--condition-id', condition)), 0)
+        summary = json.loads((folder / exporter.OUTPUT_DIRECTORY /
+                              'crop_export_summary.json').read_text(encoding='utf-8'))
+        self.assertEqual(Path(summary['omezarr_source']), source_store.resolve())
+
+    def test_zero_cache_fallback_matches_fails_clearly(self):
+        condition = next(iter(exporter.CONDITIONS))
+        folder = self._make_condition(condition, create_default_zarr=False)
+        self.cache.mkdir(parents=True, exist_ok=True)
+        self.assertEqual(exporter.run(self._args('--condition-id', condition)), 1)
+        summary = json.loads((folder / exporter.OUTPUT_DIRECTORY /
+                              'crop_export_summary.json').read_text(encoding='utf-8'))
+        self.assertIn('Expected exactly one moved OME-Zarr', summary['error'])
+        self.assertIn('found 0', summary['error'])
+
+    def test_multiple_cache_fallback_matches_fail_as_ambiguous(self):
+        condition = next(iter(exporter.CONDITIONS))
+        folder = self._make_condition(condition, create_default_zarr=False)
+        first = self._make_zarr(condition, store_name=f'first_{condition}.ome.zarr')
+        second = self._make_zarr(condition, store_name=f'second_{condition}.ome.zarr')
+        self.assertEqual(exporter.run(self._args('--condition-id', condition)), 1)
+        summary = json.loads((folder / exporter.OUTPUT_DIRECTORY /
+                              'crop_export_summary.json').read_text(encoding='utf-8'))
+        self.assertIn('Expected exactly one moved OME-Zarr', summary['error'])
+        self.assertIn('found 2', summary['error'])
+        self.assertIn(first.name, summary['error'])
+        self.assertIn(second.name, summary['error'])
+
+    def test_recorded_path_still_requires_metadata_validation(self):
+        condition = next(iter(exporter.CONDITIONS))
+        recorded = self._make_zarr(
+            condition, store_name='recorded_but_wrong_channels.ome.zarr',
+            labels=['RFP', 'GFP', 'DIC'],
+        )
+        folder = self._make_condition(condition, create_default_zarr=False)
+        (self.results / 'batch_status.json').write_text(json.dumps({
+            'conditions': {condition: {'omezarr': str(recorded)}}
+        }), encoding='utf-8')
         self.assertEqual(exporter.run(self._args('--condition-id', condition)), 1)
         summary = json.loads((folder / exporter.OUTPUT_DIRECTORY /
                               'crop_export_summary.json').read_text(encoding='utf-8'))

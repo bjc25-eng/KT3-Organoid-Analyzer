@@ -111,6 +111,10 @@ def _atomic_json(path: Path, payload: dict) -> None:
     os.replace(temporary, path)
 
 
+def _read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
 def _atomic_csv(path: Path, rows: Iterable[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + '.tmp')
@@ -160,23 +164,6 @@ def _condition_inputs(folder: Path) -> tuple[list[dict], list[dict], list[dict]]
         if not path.is_file():
             raise FileNotFoundError(f'Required approved source CSV is missing: {path}')
     return tuple(_read_csv(path) for path in paths)  # type: ignore[return-value]
-
-
-def resolve_omezarr(condition_id: str, cache_root: Path) -> Path:
-    root = cache_root.expanduser().resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f'OME-Zarr cache root does not exist: {root}')
-    exact_name = f'{condition_id}.ome.zarr'.lower()
-    candidates = sorted(
-        path.resolve() for path in root.rglob('*')
-        if path.is_dir() and path.name.lower() == exact_name
-    )
-    if len(candidates) != 1:
-        raise RuntimeError(
-            f'Expected exactly one validated OME-Zarr named {condition_id}.ome.zarr below '
-            f'{root}; found {len(candidates)}: {[str(path) for path in candidates]}'
-        )
-    return candidates[0]
 
 
 def _validate_sources(condition_id: str, wells: list[dict], pdos: list[dict],
@@ -356,15 +343,26 @@ def _restart_valid(row: dict | None, signature: str) -> bool:
 
 
 def export_condition(condition_id: str, folder: Path, args: argparse.Namespace,
+                     batch_status: dict,
                      *, probe: Callable = probe_omezarr,
                      open_group: Callable = zarr.open_group, s3_client=None) -> dict:
     started = _now()
+    condition_summary_path = folder / 'condition_summary.json'
+    if not condition_summary_path.is_file():
+        raise FileNotFoundError(
+            f'Required OME-Zarr provenance summary is missing: {condition_summary_path}'
+        )
+    condition_summary = _read_json(condition_summary_path)
     wells, pdos, rfp_rows = _condition_inputs(folder)
     _, pdo_by_id, rfp_by_id, positive = _validate_sources(condition_id, wells, pdos, rfp_rows)
     expected_ids = {_normalise_well_id(row['well_id']) for row in positive}
-    zarr_path = resolve_omezarr(condition_id, args.cache_root)
+    zarr_path = crop_base.resolve_omezarr(
+        condition_id, condition_summary, batch_status, args.cache_root
+    )
     metadata = probe(zarr_path)
-    validation = crop_base.validate_omezarr(metadata, {}, args.expected_pixel_size_um)
+    validation = crop_base.validate_omezarr(
+        metadata, condition_summary, args.expected_pixel_size_um
+    )
     root = open_group(str(zarr_path), mode='r')
     array = root[metadata['level0_array_path']]
     planes = SingletonTZCYX(array, metadata['axes'])
@@ -551,12 +549,14 @@ def run(args: argparse.Namespace, *, probe: Callable = probe_omezarr,
     if args.upload_s3 and (not args.bucket or not args.results_s3_prefix):
         raise ValueError('--upload-s3 requires --bucket and --results-s3-prefix.')
     result_root = args.result_root.expanduser().resolve()
+    batch_status_path = result_root / 'batch_status.json'
+    batch_status = _read_json(batch_status_path) if batch_status_path.is_file() else {}
     selected = args.condition_id or list(CONDITIONS)
     failures = 0
     for condition_id in selected:
         try:
             summary = export_condition(
-                condition_id, result_root / condition_id, args,
+                condition_id, result_root / condition_id, args, batch_status,
                 probe=probe, open_group=open_group, s3_client=s3_client,
             )
             if summary['status'] == 'failed_qc':
