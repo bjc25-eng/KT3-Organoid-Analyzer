@@ -124,7 +124,7 @@ class FinalPdoRfpCropExporterTests(unittest.TestCase):
                 'PDO_count': 1 if positive else 0, 'PDO_present': positive,
                 'total_PDO_projected_area_px2': 20 if positive else 0,
                 'total_PDO_projected_area_um2': 10.743 if positive else 0,
-                'qc_status': 'automated_dominant_hex_array_not_manually_reviewed',
+                'hex_array_member': True, 'lattice_degree': 6,
             }
             wells.append(well)
             if positive:
@@ -179,7 +179,7 @@ class FinalPdoRfpCropExporterTests(unittest.TestCase):
         self.assertIn('PSC cell count: NOT VALIDATED', lines)
         self.assertTrue(any(line.startswith('Full-resolution x/y:') for line in lines))
         self.assertTrue(any(line.startswith('Well radius:') for line in lines))
-        self.assertTrue(any(line.startswith('Final-array QC status:') for line in lines))
+        self.assertIn('Final-array QC status: final_dominant_hex_array_accepted', lines)
 
     def test_insufficient_background_is_not_quantified_never_zero(self):
         condition = next(iter(exporter.CONDITIONS))
@@ -276,17 +276,45 @@ class FinalPdoRfpCropExporterTests(unittest.TestCase):
                               'crop_export_summary.json').read_text(encoding='utf-8'))
         self.assertIn('Final PDO count mismatch', summary['error'])
 
-    def test_final_array_qc_status_is_required(self):
+    def test_real_production_schema_without_qc_status_succeeds(self):
         condition = next(iter(exporter.CONDITIONS))
         folder = self._make_condition(condition)
         path = folder / 'well_measurements.csv'
         rows = exporter._read_csv(path)
-        rows[0]['qc_status'] = ''
+        self.assertNotIn('qc_status', rows[0])
+        self.assertEqual(rows[0]['hex_array_member'], 'True')
+        self.assertEqual(rows[0]['lattice_degree'], '6')
+        self.assertEqual(exporter.run(self._args('--condition-id', condition)), 0)
+        manifest = exporter._read_csv(folder / exporter.OUTPUT_DIRECTORY / 'manifest.csv')
+        self.assertEqual(manifest[0]['final_array_qc_status'],
+                         'final_dominant_hex_array_accepted')
+        self.assertEqual(manifest[0]['lattice_degree'], '6')
+
+    def test_false_hex_array_member_fails_provenance_validation(self):
+        condition = next(iter(exporter.CONDITIONS))
+        folder = self._make_condition(condition)
+        path = folder / 'well_measurements.csv'
+        rows = exporter._read_csv(path)
+        rows[0]['hex_array_member'] = 'False'
         _write_dict_csv(path, list(rows[0]), rows)
         self.assertEqual(exporter.run(self._args('--condition-id', condition)), 1)
         summary = json.loads((folder / exporter.OUTPUT_DIRECTORY /
                               'crop_export_summary.json').read_text(encoding='utf-8'))
-        self.assertIn('lacks a final-array qc_status', summary['error'])
+        self.assertIn("hex_array_member='False'", summary['error'])
+        self.assertIn('expected truthy dominant-array membership', summary['error'])
+
+    def test_missing_hex_array_member_fails_clear_schema_provenance_validation(self):
+        condition = next(iter(exporter.CONDITIONS))
+        folder = self._make_condition(condition)
+        path = folder / 'well_measurements.csv'
+        rows = exporter._read_csv(path)
+        for row in rows:
+            row.pop('hex_array_member')
+        _write_dict_csv(path, list(rows[0]), rows)
+        self.assertEqual(exporter.run(self._args('--condition-id', condition)), 1)
+        summary = json.loads((folder / exporter.OUTPUT_DIRECTORY /
+                              'crop_export_summary.json').read_text(encoding='utf-8'))
+        self.assertIn('lacks required hex_array_member schema/provenance field', summary['error'])
 
     def test_restart_reuses_matching_completed_crop(self):
         condition = next(iter(exporter.CONDITIONS))

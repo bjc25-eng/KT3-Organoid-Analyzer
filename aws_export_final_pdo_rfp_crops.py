@@ -23,6 +23,7 @@ from omezarr_cyx import SingletonTZCYX
 EXPORT_VERSION = 1
 OUTPUT_DIRECTORY = 'pdo_positive_crops_final_pdo_rfp'
 COMBINED_MANIFEST = 'all_conditions_final_pdo_rfp_crop_manifest.csv'
+FINAL_ARRAY_QC_STATUS = 'final_dominant_hex_array_accepted'
 EXPECTED_PIXEL_SIZE_UM = crop_base.EXPECTED_PIXEL_SIZE_UM
 CHANNELS = dict(crop_base.CHANNELS)
 CONDITIONS = {
@@ -78,6 +79,7 @@ MANIFEST_FIELDS = (
     'total_PDO_projected_area_um2', 'PDO_measurement_row_count',
     'PDO_equivalent_circular_diameters_um',
     'x_px_fullres', 'y_px_fullres', 'radius_px', 'final_array_qc_status',
+    'lattice_degree',
     *RFP_MANIFEST_FIELDS, 'RFP_quantification_error',
     'gfp_channel', 'rfp_channel', 'dic_channel',
     'pixel_size_x_um', 'pixel_size_y_um', 'omezarr_source',
@@ -196,8 +198,15 @@ def _validate_sources(condition_id: str, wells: list[dict], pdos: list[dict],
             raise RuntimeError(f'PDO row refers to non-final well_id {well_id}.')
         pdo_by_id.setdefault(well_id, []).append(row)
     for well_id, well in well_by_id.items():
-        if not str(well.get('qc_status', '')).strip():
-            raise RuntimeError(f'Final well {well_id} lacks a final-array qc_status.')
+        if 'hex_array_member' not in well or not str(well.get('hex_array_member', '')).strip():
+            raise RuntimeError(
+                f'Final well {well_id} lacks required hex_array_member schema/provenance field.'
+            )
+        if not _truthy(well['hex_array_member']):
+            raise RuntimeError(
+                f'Final well {well_id} has hex_array_member={well["hex_array_member"]!r}; '
+                'expected truthy dominant-array membership.'
+            )
         actual = len(pdo_by_id.get(well_id, []))
         expected = int(round(_finite_number(well, 'PDO_count')))
         if actual != expected:
@@ -270,7 +279,7 @@ def header_lines(condition_id: str, well: dict, pdos: list[dict], rfp: dict) -> 
         f"Full-resolution x/y: {_finite_number(well, 'x_px_fullres'):.1f}, "
         f"{_finite_number(well, 'y_px_fullres'):.1f}",
         f"Well radius: {_finite_number(well, 'radius_px'):.1f} px",
-        f"Final-array QC status: {well.get('qc_status', '')}",
+        f'Final-array QC status: {FINAL_ARRAY_QC_STATUS}',
     ])
     return lines
 
@@ -328,7 +337,8 @@ def _source_manifest_row(condition_id: str, well: dict, pdos: list[dict], rfp: d
         'PDO_measurement_row_count': len(pdos),
         'PDO_equivalent_circular_diameters_um': ';'.join(f'{value:.12g}' for value in diameters),
         'x_px_fullres': well['x_px_fullres'], 'y_px_fullres': well['y_px_fullres'],
-        'radius_px': well['radius_px'], 'final_array_qc_status': well.get('qc_status', ''),
+        'radius_px': well['radius_px'], 'final_array_qc_status': FINAL_ARRAY_QC_STATUS,
+        'lattice_degree': well.get('lattice_degree', ''),
         'RFP_quantification_error': rfp.get('error', ''),
         'gfp_channel': CHANNELS['gfp'], 'rfp_channel': CHANNELS['rfp'],
         'dic_channel': CHANNELS['dic'], 'psc_cell_count_status': 'NOT VALIDATED',
