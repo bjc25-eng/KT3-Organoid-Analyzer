@@ -13,15 +13,8 @@ from scipy.ndimage import gaussian_filter
 from scipy.spatial import cKDTree
 
 from analysis_core import Settings, segment_pdos
-
-
-def _read_scale(root) -> tuple[float, float]:
-    try:
-        ms = root.attrs['multiscales'][0]
-        scale = ms['datasets'][0]['coordinateTransformations'][0]['scale']
-        return float(scale[-1]), float(scale[-2])
-    except Exception:
-        return 1.0, 1.0
+from nd2_omezarr import probe_omezarr
+from omezarr_cyx import SingletonTZCYX
 
 
 def _window_end(root, channel: int, dtype) -> float:
@@ -128,11 +121,17 @@ def main() -> int:
     args=ap.parse_args()
 
     started=time.time(); src=args.source.expanduser().resolve(); raw_csv=args.raw_wells_csv.expanduser().resolve(); out=args.output_dir.expanduser().resolve(); out.mkdir(parents=True,exist_ok=True)
-    root=zarr.open_group(str(src),mode='r'); arr=root['0']
-    if arr.ndim != 3:
-        raise RuntimeError(f'Expected C,Y,X OME-Zarr; got {arr.shape}')
-    _,h,w=map(int,arr.shape)
-    px_x,px_y=_read_scale(root); px_um=(px_x+px_y)/2.0
+    meta=probe_omezarr(src)
+    root=zarr.open_group(str(src),mode='r'); arr=root[meta['level0_array_path']]
+    planes=SingletonTZCYX(arr,meta['axes'])
+    c,h,w=planes.shape_cyx
+    voxel=meta.get('voxel_size_um') or {}
+    px_x=float(voxel.get('x',0) or 0); px_y=float(voxel.get('y',0) or 0)
+    if px_x <= 0 or px_y <= 0:
+        raise RuntimeError('OME-Zarr metadata does not contain valid physical X/Y pixel calibration.')
+    if not 0 <= int(args.gfp_channel) < c:
+        raise RuntimeError(f'GFP channel {args.gfp_channel} is invalid for {c} channels.')
+    px_um=(px_x+px_y)/2.0
     expected_radius=float(args.well_diameter_um)/(2.0*px_um)
     wells=_load_wells(raw_csv)
     pts=np.asarray([(x,y) for x,y,_ in wells],dtype=float)
@@ -163,7 +162,7 @@ def main() -> int:
         if not wells_here:
             continue
         rx0=max(0,cx0-overlap); ry0=max(0,cy0-overlap); rx1=min(w,cx0+cw+overlap); ry1=min(h,cy0+ch+overlap)
-        graw=np.asarray(arr[int(args.gfp_channel),ry0:ry1,rx0:rx1]); gfp=_u8_absolute(graw,gfp_max)
+        graw=planes.read(int(args.gfp_channel),slice(ry0,ry1),slice(rx0,rx1)); gfp=_u8_absolute(graw,gfp_max)
         for wi,wx,wy,wr in wells_here:
             lx,ly=int(wx-rx0),int(wy-ry0); cr=int(math.ceil(wr*0.95)); xa=max(0,lx-cr); xb=min(gfp.shape[1],lx+cr+1); ya=max(0,ly-cr); yb=min(gfp.shape[0],ly+cr+1)
             sub=gfp[ya:yb,xa:xb].astype(np.float32); yy,xx=np.ogrid[:sub.shape[0],:sub.shape[1]]; scx=lx-xa; scy=ly-ya
@@ -187,7 +186,7 @@ def main() -> int:
     _write_dicts(out/'well_measurements.csv',well_rows,['well_id','x_px_fullres','y_px_fullres','radius_px','PDO_count','PDO_present','total_PDO_projected_area_px2','total_PDO_projected_area_um2'])
     _write_dicts(out/'pdo_measurements.csv',pdo_rows,['well_id','pdo_number_in_well','centroid_x_px_fullres','centroid_y_px_fullres','projected_area_px2','projected_area_um2','equivalent_circular_diameter_um'])
 
-    summary={**info,'pixel_size_um':{'x':px_x,'y':px_y},'pdo_positive_wells':sum(bool(r['PDO_present']) for r in well_rows),'detected_pdos':len(pdo_rows),'pdo_analysis_seconds':pdo_seconds,'total_refinement_seconds':time.time()-started,'pdo_segmentation_mode':'conservative_contiguous_components_no_watershed_split','qc_status':'automated_lattice_refinement_not_manually_reviewed'}
+    summary={**info,'pixel_size_um':{'x':px_x,'y':px_y},'gfp_channel':int(args.gfp_channel),'well_diameter_um':float(args.well_diameter_um),'green_low_uint8':float(args.green_low),'green_high_uint8':float(args.green_high),'pdo_min_area_px':int(args.pdo_min_area),'pdo_positive_wells':sum(bool(r['PDO_present']) for r in well_rows),'detected_pdos':len(pdo_rows),'pdo_analysis_seconds':pdo_seconds,'total_refinement_seconds':time.time()-started,'pdo_segmentation_mode':'conservative_contiguous_components_no_watershed_split','qc_status':'automated_lattice_refinement_not_manually_reviewed'}
     (out/'refined_summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
     print(json.dumps(summary,indent=2))
     return 0
